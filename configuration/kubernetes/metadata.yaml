@@ -27,9 +27,10 @@ metadata:
   - name: kubeconfigPath
     required: false
     description: |
-      Path to a kubeconfig file. When running in-cluster, this is not needed.
-      When running outside the cluster, falls back to the KUBECONFIG env var,
-      then to ~/.kube/config.
+      Path to a kubeconfig file, passed directly to the Kubernetes client
+      library. When running in-cluster, this is not needed. When running
+      outside the cluster and not set, the client falls back to the
+      KUBECONFIG env var, then to ~/.kube/config.
     example: "/path/to/kubeconfig"
     type: string
   - name: resyncPeriod
