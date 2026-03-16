@@ -139,6 +139,18 @@ func TestMetadataNotifyChannel(t *testing.T) {
 		assert.Equal(t, "myconfig", m.NotifyChannel)
 	})
 
+	t.Run("legacy pgNotifyChannel alias is parsed correctly", func(t *testing.T) {
+		m := metadata{}
+		props := map[string]string{
+			"connectionString": "host=localhost user=postgres password=example port=5432 database=testdb",
+			"table":            "configtable",
+			"pgNotifyChannel":  "myconfig",
+		}
+		err := m.InitWithMetadata(props)
+		require.NoError(t, err)
+		assert.Equal(t, "myconfig", m.NotifyChannel)
+	})
+
 	t.Run("missing notifyChannel is allowed at init", func(t *testing.T) {
 		m := metadata{}
 		props := map[string]string{

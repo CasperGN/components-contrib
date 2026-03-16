@@ -31,7 +31,7 @@ type metadata struct {
 	pgauth.PostgresAuthMetadata `mapstructure:",squash"`
 	Timeout                     time.Duration `mapstructure:"timeout" mapstructurealiases:"timeoutInSeconds"`
 	ConfigTable                 string        `mapstructure:"table"`
-	NotifyChannel               string        `mapstructure:"notifyChannel" mapstructurealiases:"notifyChannel"`
+	NotifyChannel               string        `mapstructure:"notifyChannel" mapstructurealiases:"pgNotifyChannel"`
 	MaxIdleTimeoutOld           time.Duration `mapstructure:"connMaxIdleTime"` // Deprecated alias for "connectionMaxIdleTime"
 	aws.DeprecatedPostgresIAM   `mapstructure:",squash"`
 }

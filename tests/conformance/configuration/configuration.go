@@ -266,12 +266,12 @@ func ConformanceTests(t *testing.T, props map[string]string, store configuration
 		})
 
 		if strings.HasPrefix(component, postgresComponent) {
-			t.Run("subscriber with notifyChannel in request metadata (backward compat)", func(t *testing.T) {
+			t.Run("subscriber with pgNotifyChannel in request metadata (backward compat)", func(t *testing.T) {
 				ID, err := store.Subscribe(t.Context(),
 					&configuration.SubscribeRequest{
 						Keys: getKeys(initValues1),
 						Metadata: map[string]string{
-							"notifyChannel": "config",
+							"pgNotifyChannel": "config",
 						},
 					},
 					func(ctx context.Context, e *configuration.UpdateEvent) error {
