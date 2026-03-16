@@ -254,7 +254,7 @@ func (p *ConfigurationStore) Subscribe(ctx context.Context, req *configuration.S
 
 	notifyChannel := p.metadata.NotifyChannel
 	for k, v := range req.Metadata {
-		switch strings.ToLower(k) { //nolint:gocritic
+		switch strings.ToLower(k) {
 		case "notifychannel", "pgnotifychannel":
 			notifyChannel = v
 		}
