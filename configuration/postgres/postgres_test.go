@@ -14,6 +14,7 @@ limitations under the License.
 package postgres
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"regexp"
@@ -200,6 +201,69 @@ func TestMetadataNotifyChannel(t *testing.T) {
 		err := m.InitWithMetadata(props)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "notifyChannel name is too long")
+	})
+}
+
+func TestSubscribeNotifyChannelPrecedence(t *testing.T) {
+	// newStore creates a minimal ConfigurationStore with metadata set but no
+	// DB connection. This is sufficient to exercise the channel resolution and
+	// validation logic in Subscribe, which runs before any DB call.
+	newStore := func(componentChannel string) *ConfigurationStore {
+		return &ConfigurationStore{
+			metadata: metadata{
+				ConfigTable:   "cfgtbl",
+				NotifyChannel: componentChannel,
+			},
+			ActiveSubscriptions: make(map[string]*subscription),
+		}
+	}
+
+	t.Run("component metadata takes precedence over request pgNotifyChannel", func(t *testing.T) {
+		store := newStore("COMPONENT_UPPER")
+		_, err := store.Subscribe(t.Context(),
+			&configuration.SubscribeRequest{
+				Keys: []string{"key1"},
+				Metadata: map[string]string{
+					"pgNotifyChannel": "validlegacy",
+				},
+			}, func(ctx context.Context, e *configuration.UpdateEvent) error { return nil })
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "COMPONENT_UPPER", "expected component metadata to take precedence")
+	})
+
+	t.Run("legacy pgNotifyChannel in request is used when component metadata is empty", func(t *testing.T) {
+		store := newStore("")
+		_, err := store.Subscribe(t.Context(),
+			&configuration.SubscribeRequest{
+				Keys: []string{"key1"},
+				Metadata: map[string]string{
+					"pgNotifyChannel": "LEGACY_UPPER",
+				},
+			}, func(ctx context.Context, e *configuration.UpdateEvent) error { return nil })
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "LEGACY_UPPER", "expected the legacy key value to be used")
+	})
+
+	t.Run("component metadata is used when no request metadata keys set", func(t *testing.T) {
+		store := newStore("COMPONENT_UPPER")
+		_, err := store.Subscribe(t.Context(),
+			&configuration.SubscribeRequest{
+				Keys:     []string{"key1"},
+				Metadata: map[string]string{},
+			}, func(ctx context.Context, e *configuration.UpdateEvent) error { return nil })
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "COMPONENT_UPPER", "expected the component metadata value to be used")
+	})
+
+	t.Run("error when no channel set anywhere", func(t *testing.T) {
+		store := newStore("")
+		_, err := store.Subscribe(t.Context(),
+			&configuration.SubscribeRequest{
+				Keys:     []string{"key1"},
+				Metadata: map[string]string{},
+			}, func(ctx context.Context, e *configuration.UpdateEvent) error { return nil })
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "notifyChannel must be set")
 	})
 }
 

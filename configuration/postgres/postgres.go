@@ -252,11 +252,15 @@ func (p *ConfigurationStore) Subscribe(ctx context.Context, req *configuration.S
 		return "", errors.New("configuration store is closed")
 	}
 
+	// Component metadata is authoritative. Fall back to request metadata
+	// "pgNotifyChannel" for backwards compatibility only.
 	notifyChannel := p.metadata.NotifyChannel
-	for k, v := range req.Metadata {
-		switch strings.ToLower(k) {
-		case "notifychannel", "pgnotifychannel":
-			notifyChannel = v
+	if notifyChannel == "" {
+		for k, v := range req.Metadata {
+			if strings.EqualFold(k, "pgNotifyChannel") {
+				notifyChannel = v
+				break
+			}
 		}
 	}
 	if notifyChannel == "" {

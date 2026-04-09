@@ -91,7 +91,8 @@ metadata:
     description: |
       The PostgreSQL NOTIFY channel name for configuration change notifications.
       Must match the channel used in the database trigger function.
-      Can also be set per-request in subscribe metadata. If set per-request, that value will be used instead of this default.
+      This component-level value takes precedence over per-request metadata.
+      If not set here, clients may pass "pgNotifyChannel" in request metadata for backwards compatibility.
     example: "config"
     type: string
   - name: connectionMaxIdleTime
