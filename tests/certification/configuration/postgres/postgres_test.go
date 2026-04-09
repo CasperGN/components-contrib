@@ -56,7 +56,7 @@ const (
 	configTable         = "configtable"
 	connectionStringKey = "connectionString"
 	configTableKey      = "table"
-	notifyChannelKey    = "notifyChannel"
+	notifyChannelKey    = "pgNotifyChannel"
 	notifyChannel       = "config"
 	portOffset          = 2
 	channel1            = "channel1"
