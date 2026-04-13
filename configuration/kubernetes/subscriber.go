@@ -34,9 +34,9 @@ type subscriber struct {
 // allKeys map so that every change event reaches them without per-key iteration.
 type subscriptionRegistry struct {
 	mu      sync.RWMutex
-	byID    map[string]*subscriber              // subID -> subscriber
-	byKey   map[string]map[string]*subscriber    // configKey -> {subID -> subscriber}
-	allKeys map[string]*subscriber               // subscribers watching all keys
+	byID    map[string]*subscriber            // subID -> subscriber
+	byKey   map[string]map[string]*subscriber // configKey -> {subID -> subscriber}
+	allKeys map[string]*subscriber            // subscribers watching all keys
 }
 
 func newSubscriptionRegistry() *subscriptionRegistry {

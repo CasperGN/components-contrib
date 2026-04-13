@@ -144,9 +144,13 @@ func TestKubernetes(t *testing.T) {
 					updateEvent := &configuration.UpdateEvent{
 						Items: castConfigurationItems(items),
 					}
-					// Strip version since it's system-assigned (resourceVersion)
+					// Strip version since it's system-assigned (resourceVersion).
+					// Normalize nil metadata to empty map for consistent JSON serialization.
 					for _, item := range updateEvent.Items {
 						item.Version = ""
+						if item.Metadata == nil {
+							item.Metadata = map[string]string{}
+						}
 					}
 					updateEventJSON, err := json.Marshal(updateEvent)
 					if err != nil {

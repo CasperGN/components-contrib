@@ -12,4 +12,14 @@ metadata:
 data: {}
 EOF
 
+# Create the ConfigMap used by the certification test
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dapr-cert-test
+  namespace: default
+data: {}
+EOF
+
 echo "NAMESPACE=default" >> $GITHUB_ENV

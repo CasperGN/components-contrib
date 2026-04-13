@@ -158,19 +158,23 @@ func (s *ConfigurationStore) Subscribe(ctx context.Context, req *configuration.S
 	}
 	s.registry.add(sub)
 
-	// Deliver current state so callers do not need to Get then Subscribe.
-	resp, err := s.Get(ctx, &configuration.GetRequest{
-		Keys:     req.Keys,
-		Metadata: req.Metadata,
-	})
-	if err == nil && len(resp.Items) > 0 {
-		if hErr := handler(ctx, &configuration.UpdateEvent{
-			ID:    subscribeID,
-			Items: resp.Items,
-		}); hErr != nil {
-			s.logger.Errorf("failed to send initial state for subscription %s: %v", subscribeID, hErr)
+	// Deliver current state asynchronously. The Dapr sidecar's gRPC handler
+	// blocks until Subscribe returns (to send the subscription ID first), so
+	// calling the handler synchronously here would deadlock.
+	go func() {
+		resp, err := s.Get(ctx, &configuration.GetRequest{
+			Keys:     req.Keys,
+			Metadata: req.Metadata,
+		})
+		if err == nil && len(resp.Items) > 0 {
+			if hErr := handler(ctx, &configuration.UpdateEvent{
+				ID:    subscribeID,
+				Items: resp.Items,
+			}); hErr != nil {
+				s.logger.Errorf("failed to send initial state for subscription %s: %v", subscribeID, hErr)
+			}
 		}
-	}
+	}()
 
 	return subscribeID, nil
 }

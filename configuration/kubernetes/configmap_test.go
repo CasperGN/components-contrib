@@ -16,6 +16,7 @@ package kubernetes
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,8 +27,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
-
-	"fmt"
 
 	"github.com/dapr/components-contrib/configuration"
 	contribMetadata "github.com/dapr/components-contrib/metadata"
@@ -843,17 +842,23 @@ func TestSubscribe_InitialState(t *testing.T) {
 	store := newTestStore(t, cm)
 	store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("default")}
 
-	var received *configuration.UpdateEvent
+	receivedCh := make(chan *configuration.UpdateEvent, 1)
 	_, err := store.Subscribe(t.Context(), &configuration.SubscribeRequest{
 		Keys:     []string{"log.level"},
 		Metadata: map[string]string{},
 	}, func(_ context.Context, e *configuration.UpdateEvent) error {
-		received = e
+		receivedCh <- e
 		return nil
 	})
 	require.NoError(t, err)
-	require.NotNil(t, received)
-	assert.Equal(t, "info", received.Items["log.level"].Value)
+
+	select {
+	case received := <-receivedCh:
+		require.NotNil(t, received)
+		assert.Equal(t, "info", received.Items["log.level"].Value)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for initial state delivery")
+	}
 
 	require.NoError(t, store.Close())
 }
@@ -864,7 +869,7 @@ func TestSubscriptionRegistry(t *testing.T) {
 		r.add(&subscriber{
 			id:     "s1",
 			keys:   []string{"key1"},
-			ctx:    context.Background(),
+			ctx:    t.Context(),
 			cancel: func() {},
 			handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
 				return nil
@@ -886,7 +891,7 @@ func TestSubscriptionRegistry(t *testing.T) {
 		r.add(&subscriber{
 			id:     "s1",
 			keys:   []string{},
-			ctx:    context.Background(),
+			ctx:    t.Context(),
 			cancel: func() {},
 			handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
 				return nil
@@ -908,7 +913,7 @@ func TestSubscriptionRegistry(t *testing.T) {
 			r.add(&subscriber{
 				id:     id,
 				keys:   []string{"k"},
-				ctx:    context.Background(),
+				ctx:    t.Context(),
 				cancel: func() { count.Add(1) },
 				handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
 					return nil
@@ -928,7 +933,7 @@ func TestSubscriptionRegistry(t *testing.T) {
 			r.add(&subscriber{
 				id:     id,
 				keys:   []string{"shared-key"},
-				ctx:    context.Background(),
+				ctx:    t.Context(),
 				cancel: func() {},
 				handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
 					return nil
