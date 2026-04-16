@@ -27,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
 
 	"github.com/dapr/components-contrib/configuration"
 	contribMetadata "github.com/dapr/components-contrib/metadata"
@@ -41,18 +42,22 @@ func newTestStore(t *testing.T, objects ...corev1.ConfigMap) *ConfigurationStore
 	t.Setenv("NAMESPACE", "default")
 
 	fakeClient := fake.NewSimpleClientset()
+	informerStore := cache.NewStore(cache.MetaNamespaceKeyFunc)
+
 	for i := range objects {
 		_, err := fakeClient.CoreV1().ConfigMaps(objects[i].Namespace).Create(
 			t.Context(), &objects[i], metav1.CreateOptions{},
 		)
 		require.NoError(t, err)
+		require.NoError(t, informerStore.Add(&objects[i]))
 	}
 
 	return &ConfigurationStore{
-		kubeClient: fakeClient,
-		namespace:  "default",
-		logger:     logger.NewLogger("test"),
-		registry:   newSubscriptionRegistry(),
+		kubeClient:    fakeClient,
+		informerStore: informerStore,
+		namespace:     "default",
+		logger:        logger.NewLogger("test"),
+		registry:      newSubscriptionRegistry(),
 	}
 }
 
@@ -295,12 +300,12 @@ func TestGet_ConfigMapNotFound(t *testing.T) {
 	store := newTestStore(t)
 	store.metadata = metadata{ConfigMapName: "missing"}
 
-	_, err := store.Get(t.Context(), &configuration.GetRequest{
+	resp, err := store.Get(t.Context(), &configuration.GetRequest{
 		Keys:     []string{},
 		Metadata: map[string]string{},
 	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to get ConfigMap")
+	require.NoError(t, err)
+	assert.Empty(t, resp.Items)
 }
 
 func TestUnsubscribe_Valid(t *testing.T) {
@@ -936,6 +941,84 @@ func TestFanOutAdd(t *testing.T) {
 		store.fanOutAdd(&corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"},
 		})
+
+		assert.False(t, handlerCalled)
+	})
+}
+
+func TestFanOutDelete(t *testing.T) {
+	t.Run("notifies subscribers with deleted markers", func(t *testing.T) {
+		store := newTestStore(t)
+		store.metadata = metadata{ConfigMapName: "my-config"}
+
+		receivedCh := make(chan *configuration.UpdateEvent, 1)
+		store.registry.add(&subscriber{
+			id:     "sub-all",
+			ctx:    t.Context(),
+			cancel: func() {},
+			keys:   []string{},
+			handler: func(_ context.Context, e *configuration.UpdateEvent) error {
+				receivedCh <- e
+				return nil
+			},
+		})
+
+		store.fanOutDelete(&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "5"},
+			Data:       map[string]string{"key1": "val1", "key2": "val2"},
+		})
+
+		select {
+		case received := <-receivedCh:
+			assert.Len(t, received.Items, 2)
+			assert.Equal(t, "true", received.Items["key1"].Metadata["deleted"])
+			assert.Equal(t, "true", received.Items["key2"].Metadata["deleted"])
+			assert.Equal(t, "", received.Items["key1"].Value)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for delete notification")
+		}
+	})
+
+	t.Run("empty ConfigMap triggers no notifications", func(t *testing.T) {
+		store := newTestStore(t)
+		store.metadata = metadata{ConfigMapName: "my-config"}
+
+		handlerCalled := false
+		store.registry.add(&subscriber{
+			id:     "sub-1",
+			ctx:    t.Context(),
+			cancel: func() {},
+			keys:   []string{},
+			handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
+				handlerCalled = true
+				return nil
+			},
+		})
+
+		store.fanOutDelete(&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "5"},
+		})
+
+		assert.False(t, handlerCalled)
+	})
+
+	t.Run("non-ConfigMap objects are ignored", func(t *testing.T) {
+		store := newTestStore(t)
+		store.metadata = metadata{ConfigMapName: "my-config"}
+
+		handlerCalled := false
+		store.registry.add(&subscriber{
+			id:     "sub-1",
+			ctx:    t.Context(),
+			cancel: func() {},
+			keys:   []string{},
+			handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
+				handlerCalled = true
+				return nil
+			},
+		})
+
+		store.fanOutDelete("not-a-configmap")
 
 		assert.False(t, handlerCalled)
 	})

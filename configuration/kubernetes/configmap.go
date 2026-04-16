@@ -56,6 +56,7 @@ type ConfigurationStore struct {
 	registry *subscriptionRegistry
 
 	// Shared informer lifecycle: started in Init, stopped in Close.
+	informerStore  cache.Store
 	informerCancel context.CancelFunc
 	informerWg     sync.WaitGroup
 
@@ -71,7 +72,7 @@ func NewKubernetesConfigMapStore(logger logger.Logger) configuration.Store {
 	}
 }
 
-func (s *ConfigurationStore) Init(_ context.Context, meta configuration.Metadata) error {
+func (s *ConfigurationStore) Init(ctx context.Context, meta configuration.Metadata) error {
 	if err := s.metadata.parse(meta); err != nil {
 		return fmt.Errorf("failed to parse metadata: %w", err)
 	}
@@ -100,47 +101,32 @@ func (s *ConfigurationStore) Init(_ context.Context, meta configuration.Metadata
 	return nil
 }
 
-func (s *ConfigurationStore) Get(ctx context.Context, req *configuration.GetRequest) (*configuration.GetResponse, error) {
-	cm, err := s.kubeClient.CoreV1().ConfigMaps(s.namespace).Get(ctx, s.metadata.ConfigMapName, metav1.GetOptions{})
+func (s *ConfigurationStore) Get(_ context.Context, req *configuration.GetRequest) (*configuration.GetResponse, error) {
+	obj, exists, err := s.informerStore.GetByKey(s.namespace + "/" + s.metadata.ConfigMapName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get ConfigMap %q: %w", s.metadata.ConfigMapName, err)
+		return nil, fmt.Errorf("failed to get ConfigMap %q from cache: %w", s.metadata.ConfigMapName, err)
+	}
+	if !exists {
+		return &configuration.GetResponse{Items: map[string]*configuration.Item{}}, nil
 	}
 
-	items := make(map[string]*configuration.Item)
+	cm, ok := obj.(*corev1.ConfigMap)
+	if !ok {
+		return nil, fmt.Errorf("unexpected object type in cache for ConfigMap %q", s.metadata.ConfigMapName)
+	}
+
+	allItems := configMapToItems(cm)
 
 	if len(req.Keys) == 0 {
-		for k, v := range cm.Data {
-			items[k] = &configuration.Item{
-				Value:    v,
-				Version:  cm.ResourceVersion,
-				Metadata: map[string]string{},
-			}
-		}
-		for k, v := range cm.BinaryData {
-			items[k] = &configuration.Item{
-				Value:    base64.StdEncoding.EncodeToString(v),
-				Version:  cm.ResourceVersion,
-				Metadata: map[string]string{"encoding": "base64"},
-			}
-		}
-	} else {
-		for _, key := range req.Keys {
-			if v, ok := cm.Data[key]; ok {
-				items[key] = &configuration.Item{
-					Value:    v,
-					Version:  cm.ResourceVersion,
-					Metadata: map[string]string{},
-				}
-			} else if v, ok := cm.BinaryData[key]; ok {
-				items[key] = &configuration.Item{
-					Value:    base64.StdEncoding.EncodeToString(v),
-					Version:  cm.ResourceVersion,
-					Metadata: map[string]string{"encoding": "base64"},
-				}
-			}
-		}
+		return &configuration.GetResponse{Items: allItems}, nil
 	}
 
+	items := make(map[string]*configuration.Item, len(req.Keys))
+	for _, key := range req.Keys {
+		if item, ok := allItems[key]; ok {
+			items[key] = item
+		}
+	}
 	return &configuration.GetResponse{Items: items}, nil
 }
 
@@ -162,36 +148,42 @@ func (s *ConfigurationStore) Subscribe(ctx context.Context, req *configuration.S
 		ctx:     childCtx,
 		cancel:  cancel,
 	}
+	// Read initial state from cache (instant, no API call).
+	resp, err := s.Get(childCtx, &configuration.GetRequest{
+		Keys:     req.Keys,
+		Metadata: req.Metadata,
+	})
+	if err != nil {
+		cancel()
+		return "", fmt.Errorf("failed to get initial state: %w", err)
+	}
+
 	s.registry.add(sub)
 
-	// Deliver current state asynchronously. The Dapr sidecar's gRPC handler
+	// Deliver initial state asynchronously. The Dapr sidecar's gRPC handler
 	// blocks until Subscribe returns (to send the subscription ID first), so
 	// calling the handler synchronously here would deadlock.
-	go func() {
-		resp, err := s.Get(childCtx, &configuration.GetRequest{
-			Keys:     req.Keys,
-			Metadata: req.Metadata,
-		})
-		if err == nil && len(resp.Items) > 0 {
+	if len(resp.Items) > 0 {
+		go func() {
 			if hErr := handler(childCtx, &configuration.UpdateEvent{
 				ID:    subscribeID,
 				Items: resp.Items,
 			}); hErr != nil {
 				s.logger.Errorf("failed to send initial state for subscription %s: %v", subscribeID, hErr)
 			}
-		}
-	}()
+		}()
+	}
 
 	return subscribeID, nil
 }
 
 // startInformer starts a single informer that watches the configured ConfigMap
 // and fans out change events to all registered subscribers.
-func (s *ConfigurationStore) startInformer() error {
+func (s *ConfigurationStore) startInformer(ctx context.Context) error {
 	// The informer must outlive the Init context (which is request-scoped), so
 	// we create a dedicated context controlled by s.informerCancel that lives
 	// until Close() is called.
-	ctx, cancel := context.WithCancel(context.Background())
+	informerCtx, cancel := context.WithCancel(context.Background())
 	s.informerCancel = cancel
 
 	var resyncPeriod time.Duration
@@ -203,15 +195,15 @@ func (s *ConfigurationStore) startInformer() error {
 	watchlist := &cache.ListWatch{
 		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 			options.FieldSelector = fieldSelector
-			return s.kubeClient.CoreV1().ConfigMaps(s.namespace).List(ctx, options)
+			return s.kubeClient.CoreV1().ConfigMaps(s.namespace).List(informerCtx, options)
 		},
 		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 			options.FieldSelector = fieldSelector
-			return s.kubeClient.CoreV1().ConfigMaps(s.namespace).Watch(ctx, options)
+			return s.kubeClient.CoreV1().ConfigMaps(s.namespace).Watch(informerCtx, options)
 		},
 	}
 
-	_, controller := cache.NewInformerWithOptions(cache.InformerOptions{
+	store, controller := cache.NewInformerWithOptions(cache.InformerOptions{
 		ListerWatcher: watchlist,
 		ObjectType:    &corev1.ConfigMap{},
 		ResyncPeriod:  resyncPeriod,
@@ -222,16 +214,22 @@ func (s *ConfigurationStore) startInformer() error {
 			UpdateFunc: func(oldObj, newObj any) {
 				s.fanOutUpdate(oldObj, newObj)
 			},
+			DeleteFunc: func(obj any) {
+				s.fanOutDelete(obj)
+			},
 		},
 	})
+
+	s.informerStore = store
 
 	s.informerWg.Add(1)
 	go func() {
 		defer s.informerWg.Done()
-		controller.Run(ctx.Done())
+		controller.Run(informerCtx.Done())
 		s.logger.Info("ConfigMap informer stopped")
 	}()
 
+	// Use Init's context for the sync check — it provides a timeout bound.
 	if !cache.WaitForCacheSync(ctx.Done(), controller.HasSynced) {
 		cancel()
 		s.informerWg.Wait()
@@ -250,6 +248,38 @@ func (s *ConfigurationStore) fanOutAdd(obj any) {
 	}
 
 	items := configMapToItems(cm)
+	if len(items) == 0 {
+		return
+	}
+
+	s.dispatchToSubscribers(items)
+}
+
+// fanOutDelete notifies subscribers that all keys have been deleted when the
+// ConfigMap is removed from the cluster.
+func (s *ConfigurationStore) fanOutDelete(obj any) {
+	cm, ok := obj.(*corev1.ConfigMap)
+	if !ok {
+		s.logger.Warn("received non-ConfigMap object in delete handler")
+		return
+	}
+
+	items := make(map[string]*configuration.Item, len(cm.Data)+len(cm.BinaryData))
+	for k := range cm.Data {
+		items[k] = &configuration.Item{
+			Value:    "",
+			Version:  cm.ResourceVersion,
+			Metadata: map[string]string{"deleted": "true"},
+		}
+	}
+	for k := range cm.BinaryData {
+		items[k] = &configuration.Item{
+			Value:    "",
+			Version:  cm.ResourceVersion,
+			Metadata: map[string]string{"deleted": "true"},
+		}
+	}
+
 	if len(items) == 0 {
 		return
 	}
