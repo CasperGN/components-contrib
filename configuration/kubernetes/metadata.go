@@ -26,7 +26,6 @@ import (
 )
 
 type metadata struct {
-	Namespace      *string        `mapstructure:"namespace"`
 	ConfigMapName  string         `mapstructure:"configMapName"`
 	KubeconfigPath *string        `mapstructure:"kubeconfigPath"`
 	ResyncPeriod   *time.Duration `mapstructure:"resyncPeriod"`
@@ -43,12 +42,6 @@ func (m *metadata) parse(meta configuration.Metadata) error {
 
 	if errs := validation.IsDNS1123Subdomain(m.ConfigMapName); len(errs) > 0 {
 		return fmt.Errorf("configMapName %q is not a valid Kubernetes resource name: %s", m.ConfigMapName, strings.Join(errs, "; "))
-	}
-
-	if m.Namespace != nil {
-		if errs := validation.IsDNS1123Label(*m.Namespace); len(errs) > 0 {
-			return fmt.Errorf("namespace %q is not a valid Kubernetes namespace name: %s", *m.Namespace, strings.Join(errs, "; "))
-		}
 	}
 
 	return nil

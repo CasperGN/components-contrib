@@ -31,11 +31,14 @@ import (
 	"github.com/dapr/components-contrib/configuration"
 	contribMetadata "github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/kit/logger"
-	"github.com/dapr/kit/ptr"
 )
 
 func newTestStore(t *testing.T, objects ...corev1.ConfigMap) *ConfigurationStore {
 	t.Helper()
+
+	// Namespace is derived from the NAMESPACE env var (set by daprd via
+	// downward API). Default to "default" for tests.
+	t.Setenv("NAMESPACE", "default")
 
 	fakeClient := fake.NewSimpleClientset()
 	for i := range objects {
@@ -47,6 +50,7 @@ func newTestStore(t *testing.T, objects ...corev1.ConfigMap) *ConfigurationStore
 
 	return &ConfigurationStore{
 		kubeClient: fakeClient,
+		namespace:  "default",
 		logger:     logger.NewLogger("test"),
 		registry:   newSubscriptionRegistry(),
 	}
@@ -79,40 +83,22 @@ func TestMetadata_Parse(t *testing.T) {
 			Base: contribMetadata.Base{
 				Properties: map[string]string{
 					"configMapName": "my-config",
-					"namespace":     "production",
 				},
 			},
 		})
 		require.NoError(t, err)
 		assert.Equal(t, "my-config", m.ConfigMapName)
-		require.NotNil(t, m.Namespace)
-		assert.Equal(t, "production", *m.Namespace)
 	})
 
 	t.Run("missing configMapName returns error", func(t *testing.T) {
 		var m metadata
 		err := m.parse(configuration.Metadata{
 			Base: contribMetadata.Base{
-				Properties: map[string]string{
-					"namespace": "default",
-				},
+				Properties: map[string]string{},
 			},
 		})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "configMapName is required")
-	})
-
-	t.Run("namespace nil when not set", func(t *testing.T) {
-		var m metadata
-		err := m.parse(configuration.Metadata{
-			Base: contribMetadata.Base{
-				Properties: map[string]string{
-					"configMapName": "my-config",
-				},
-			},
-		})
-		require.NoError(t, err)
-		assert.Nil(t, m.Namespace)
 	})
 
 	t.Run("dotted configMapName is valid (DNS subdomain)", func(t *testing.T) {
@@ -139,34 +125,6 @@ func TestMetadata_Parse(t *testing.T) {
 		})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "not a valid Kubernetes resource name")
-	})
-
-	t.Run("dotted namespace is rejected (must be DNS label)", func(t *testing.T) {
-		var m metadata
-		err := m.parse(configuration.Metadata{
-			Base: contribMetadata.Base{
-				Properties: map[string]string{
-					"configMapName": "my-config",
-					"namespace":     "my.namespace",
-				},
-			},
-		})
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "not a valid Kubernetes namespace name")
-	})
-
-	t.Run("invalid namespace is rejected", func(t *testing.T) {
-		var m metadata
-		err := m.parse(configuration.Metadata{
-			Base: contribMetadata.Base{
-				Properties: map[string]string{
-					"configMapName": "my-config",
-					"namespace":     "../../etc",
-				},
-			},
-		})
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "not a valid Kubernetes namespace name")
 	})
 
 	t.Run("resyncPeriod is parsed", func(t *testing.T) {
@@ -200,19 +158,17 @@ func TestMetadata_Parse(t *testing.T) {
 
 func TestInit_ValidMetadata(t *testing.T) {
 	store := newTestStore(t)
+	t.Setenv("NAMESPACE", "default")
 
 	err := store.Init(t.Context(), configuration.Metadata{
 		Base: contribMetadata.Base{
 			Properties: map[string]string{
 				"configMapName": "my-config",
-				"namespace":     "default",
 			},
 		},
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "my-config", store.metadata.ConfigMapName)
-	require.NotNil(t, store.metadata.Namespace)
-	assert.Equal(t, "default", *store.metadata.Namespace)
 
 	// Clean up informer started by Init.
 	require.NoError(t, store.Close())
@@ -223,9 +179,7 @@ func TestInit_InvalidMetadata(t *testing.T) {
 
 	err := store.Init(t.Context(), configuration.Metadata{
 		Base: contribMetadata.Base{
-			Properties: map[string]string{
-				"namespace": "default",
-			},
+			Properties: map[string]string{},
 		},
 	})
 	require.Error(t, err)
@@ -235,7 +189,7 @@ func TestInit_InvalidMetadata(t *testing.T) {
 func TestGet_AllKeys(t *testing.T) {
 	cm := testConfigMap()
 	store := newTestStore(t, cm)
-	store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("default")}
+	store.metadata = metadata{ConfigMapName: "my-config"}
 
 	resp, err := store.Get(t.Context(), &configuration.GetRequest{
 		Keys:     []string{},
@@ -251,7 +205,7 @@ func TestGet_AllKeys(t *testing.T) {
 func TestGet_SpecificKeys(t *testing.T) {
 	cm := testConfigMap()
 	store := newTestStore(t, cm)
-	store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("default")}
+	store.metadata = metadata{ConfigMapName: "my-config"}
 
 	resp, err := store.Get(t.Context(), &configuration.GetRequest{
 		Keys:     []string{"log.level"},
@@ -265,7 +219,7 @@ func TestGet_SpecificKeys(t *testing.T) {
 func TestGet_MissingKeys(t *testing.T) {
 	cm := testConfigMap()
 	store := newTestStore(t, cm)
-	store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("default")}
+	store.metadata = metadata{ConfigMapName: "my-config"}
 
 	resp, err := store.Get(t.Context(), &configuration.GetRequest{
 		Keys:     []string{"nonexistent.key"},
@@ -290,7 +244,7 @@ func TestGet_BinaryData(t *testing.T) {
 		},
 	}
 	store := newTestStore(t, cm)
-	store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("default")}
+	store.metadata = metadata{ConfigMapName: "my-config"}
 
 	t.Run("get all includes binary data", func(t *testing.T) {
 		resp, err := store.Get(t.Context(), &configuration.GetRequest{
@@ -327,7 +281,7 @@ func TestGet_EmptyConfigMap(t *testing.T) {
 		},
 	}
 	store := newTestStore(t, cm)
-	store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("default")}
+	store.metadata = metadata{ConfigMapName: "my-config"}
 
 	resp, err := store.Get(t.Context(), &configuration.GetRequest{
 		Keys:     []string{},
@@ -339,7 +293,7 @@ func TestGet_EmptyConfigMap(t *testing.T) {
 
 func TestGet_ConfigMapNotFound(t *testing.T) {
 	store := newTestStore(t)
-	store.metadata = metadata{ConfigMapName: "missing", Namespace: ptr.Of("default")}
+	store.metadata = metadata{ConfigMapName: "missing"}
 
 	_, err := store.Get(t.Context(), &configuration.GetRequest{
 		Keys:     []string{},
@@ -351,7 +305,7 @@ func TestGet_ConfigMapNotFound(t *testing.T) {
 
 func TestUnsubscribe_Valid(t *testing.T) {
 	store := newTestStore(t)
-	store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("default")}
+	store.metadata = metadata{ConfigMapName: "my-config"}
 
 	cancelled := false
 	store.registry.add(&subscriber{
@@ -371,7 +325,7 @@ func TestUnsubscribe_Valid(t *testing.T) {
 
 func TestUnsubscribe_InvalidID(t *testing.T) {
 	store := newTestStore(t)
-	store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("default")}
+	store.metadata = metadata{ConfigMapName: "my-config"}
 
 	err := store.Unsubscribe(t.Context(), &configuration.UnsubscribeRequest{ID: "nonexistent"})
 	require.Error(t, err)
@@ -380,7 +334,7 @@ func TestUnsubscribe_InvalidID(t *testing.T) {
 
 func TestClose_CancelsAllSubscriptions(t *testing.T) {
 	store := newTestStore(t)
-	store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("default")}
+	store.metadata = metadata{ConfigMapName: "my-config"}
 
 	var mu sync.Mutex
 	cancelledIDs := []string{}
@@ -411,7 +365,7 @@ func TestClose_CancelsAllSubscriptions(t *testing.T) {
 func TestClose_PreventsFurtherSubscriptions(t *testing.T) {
 	cm := testConfigMap()
 	store := newTestStore(t, cm)
-	store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("default")}
+	store.metadata = metadata{ConfigMapName: "my-config"}
 
 	err := store.Close()
 	require.NoError(t, err)
@@ -426,57 +380,14 @@ func TestClose_PreventsFurtherSubscriptions(t *testing.T) {
 	assert.Contains(t, err.Error(), "closed")
 }
 
-func TestNamespaceResolution(t *testing.T) {
-	t.Run("request metadata takes precedence", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("component-ns")}
-
-		ns := store.resolveNamespace(map[string]string{"namespace": "request-ns"})
-		assert.Equal(t, "request-ns", ns)
-	})
-
-	t.Run("env var fallback when namespace not set", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config"}
-
+func TestResolveNamespace(t *testing.T) {
+	t.Run("uses NAMESPACE env var", func(t *testing.T) {
 		t.Setenv("NAMESPACE", "env-ns")
-		ns := store.resolveNamespace(map[string]string{})
-		assert.Equal(t, "env-ns", ns)
+		assert.Equal(t, "env-ns", resolveNamespace())
 	})
 
-	t.Run("env var ignored when namespace is explicit", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("component-ns")}
-
-		t.Setenv("NAMESPACE", "env-ns")
-		ns := store.resolveNamespace(map[string]string{})
-		assert.Equal(t, "component-ns", ns)
-	})
-
-	t.Run("component metadata namespace used", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("component-ns")}
-
-		ns := store.resolveNamespace(map[string]string{})
-		assert.Equal(t, "component-ns", ns)
-	})
-
-	t.Run("defaults to 'default' when nothing set", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config"}
-
-		ns := store.resolveNamespace(map[string]string{})
-		assert.Equal(t, "default", ns)
-	})
-
-	t.Run("namespace override passes through to API server", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("component-ns")}
-
-		// Invalid namespace is no longer validated client-side; the K8s API
-		// server handles validation.
-		ns := store.resolveNamespace(map[string]string{"namespace": "../../etc"})
-		assert.Equal(t, "../../etc", ns)
+	t.Run("defaults to 'default' when env var not set", func(t *testing.T) {
+		assert.Equal(t, "default", resolveNamespace())
 	})
 }
 
@@ -591,7 +502,7 @@ func TestComputeChangedItems(t *testing.T) {
 func TestFanOutUpdate(t *testing.T) {
 	t.Run("dispatches to multiple subscribers", func(t *testing.T) {
 		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("default")}
+		store.metadata = metadata{ConfigMapName: "my-config"}
 
 		var mu sync.Mutex
 		receivedByID := map[string]*configuration.UpdateEvent{}
@@ -631,7 +542,7 @@ func TestFanOutUpdate(t *testing.T) {
 
 	t.Run("filters per subscriber key set", func(t *testing.T) {
 		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("default")}
+		store.metadata = metadata{ConfigMapName: "my-config"}
 
 		var mu sync.Mutex
 		receivedByID := map[string]*configuration.UpdateEvent{}
@@ -678,7 +589,7 @@ func TestFanOutUpdate(t *testing.T) {
 
 	t.Run("skips cancelled subscribers", func(t *testing.T) {
 		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("default")}
+		store.metadata = metadata{ConfigMapName: "my-config"}
 
 		cancelledCtx, cancel := context.WithCancel(t.Context())
 		cancel() // cancel immediately
@@ -711,7 +622,7 @@ func TestFanOutUpdate(t *testing.T) {
 
 	t.Run("non-ConfigMap objects are ignored", func(t *testing.T) {
 		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("default")}
+		store.metadata = metadata{ConfigMapName: "my-config"}
 
 		handlerCalled := false
 		store.registry.add(&subscriber{
@@ -732,7 +643,7 @@ func TestFanOutUpdate(t *testing.T) {
 
 	t.Run("same ResourceVersion is skipped", func(t *testing.T) {
 		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("default")}
+		store.metadata = metadata{ConfigMapName: "my-config"}
 
 		handlerCalled := false
 		store.registry.add(&subscriber{
@@ -758,7 +669,7 @@ func TestFanOutUpdate(t *testing.T) {
 
 	t.Run("data unchanged is skipped despite different ResourceVersion", func(t *testing.T) {
 		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("default")}
+		store.metadata = metadata{ConfigMapName: "my-config"}
 
 		handlerCalled := false
 		store.registry.add(&subscriber{
@@ -788,7 +699,7 @@ func TestFanOutUpdate(t *testing.T) {
 
 	t.Run("concurrent dispatch to subscribers", func(t *testing.T) {
 		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("default")}
+		store.metadata = metadata{ConfigMapName: "my-config"}
 
 		var maxConcurrent atomic.Int32
 		var currentConcurrent atomic.Int32
@@ -837,10 +748,203 @@ func TestFanOutUpdate(t *testing.T) {
 	})
 }
 
+func TestFanOutUpdate_HandlerCanUnsubscribeWithoutDeadlock(t *testing.T) {
+	store := newTestStore(t)
+	store.metadata = metadata{ConfigMapName: "my-config"}
+
+	doneCh := make(chan struct{})
+	store.registry.add(&subscriber{
+		id:     "self-unsub",
+		ctx:    t.Context(),
+		cancel: func() {},
+		keys:   []string{},
+		handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
+			// Calling Unsubscribe from within a handler would deadlock if
+			// fanOutUpdate held the lock during dispatch.
+			_ = store.Unsubscribe(t.Context(), &configuration.UnsubscribeRequest{ID: "self-unsub"})
+			close(doneCh)
+			return nil
+		},
+	})
+
+	go store.fanOutUpdate(
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"},
+			Data:       map[string]string{"key1": "old"},
+		},
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "2"},
+			Data:       map[string]string{"key1": "new"},
+		},
+	)
+
+	select {
+	case <-doneCh:
+		// Success — no deadlock.
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadlock: fanOutUpdate did not complete within 5s")
+	}
+}
+
+func TestFanOutAdd(t *testing.T) {
+	t.Run("notifies all-key subscribers on ConfigMap creation", func(t *testing.T) {
+		store := newTestStore(t)
+		store.metadata = metadata{ConfigMapName: "my-config"}
+
+		receivedCh := make(chan *configuration.UpdateEvent, 1)
+		store.registry.add(&subscriber{
+			id:     "sub-all",
+			ctx:    t.Context(),
+			cancel: func() {},
+			keys:   []string{},
+			handler: func(_ context.Context, e *configuration.UpdateEvent) error {
+				receivedCh <- e
+				return nil
+			},
+		})
+
+		store.fanOutAdd(&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"},
+			Data:       map[string]string{"key1": "val1", "key2": "val2"},
+		})
+
+		select {
+		case received := <-receivedCh:
+			assert.Len(t, received.Items, 2)
+			assert.Equal(t, "val1", received.Items["key1"].Value)
+			assert.Equal(t, "val2", received.Items["key2"].Value)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for add notification")
+		}
+	})
+
+	t.Run("filters per subscriber key set on add", func(t *testing.T) {
+		store := newTestStore(t)
+		store.metadata = metadata{ConfigMapName: "my-config"}
+
+		var mu sync.Mutex
+		receivedByID := map[string]*configuration.UpdateEvent{}
+
+		store.registry.add(&subscriber{
+			id:     "sub-key1",
+			ctx:    t.Context(),
+			cancel: func() {},
+			keys:   []string{"key1"},
+			handler: func(_ context.Context, e *configuration.UpdateEvent) error {
+				mu.Lock()
+				receivedByID["sub-key1"] = e
+				mu.Unlock()
+				return nil
+			},
+		})
+		store.registry.add(&subscriber{
+			id:     "sub-key3",
+			ctx:    t.Context(),
+			cancel: func() {},
+			keys:   []string{"key3"},
+			handler: func(_ context.Context, e *configuration.UpdateEvent) error {
+				mu.Lock()
+				receivedByID["sub-key3"] = e
+				mu.Unlock()
+				return nil
+			},
+		})
+
+		store.fanOutAdd(&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"},
+			Data:       map[string]string{"key1": "val1", "key2": "val2"},
+		})
+
+		// sub-key1 gets key1; sub-key3 gets nothing (key3 not in ConfigMap).
+		require.Eventually(t, func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return len(receivedByID) > 0
+		}, 2*time.Second, 10*time.Millisecond)
+
+		mu.Lock()
+		defer mu.Unlock()
+		assert.Contains(t, receivedByID, "sub-key1")
+		assert.Len(t, receivedByID["sub-key1"].Items, 1)
+		assert.NotContains(t, receivedByID, "sub-key3")
+	})
+
+	t.Run("skips cancelled subscribers", func(t *testing.T) {
+		store := newTestStore(t)
+		store.metadata = metadata{ConfigMapName: "my-config"}
+
+		cancelledCtx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		handlerCalled := false
+		store.registry.add(&subscriber{
+			id:     "cancelled-sub",
+			ctx:    cancelledCtx,
+			cancel: cancel,
+			keys:   []string{},
+			handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
+				handlerCalled = true
+				return nil
+			},
+		})
+
+		store.fanOutAdd(&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"},
+			Data:       map[string]string{"key1": "val1"},
+		})
+
+		assert.False(t, handlerCalled)
+	})
+
+	t.Run("non-ConfigMap objects are ignored", func(t *testing.T) {
+		store := newTestStore(t)
+		store.metadata = metadata{ConfigMapName: "my-config"}
+
+		handlerCalled := false
+		store.registry.add(&subscriber{
+			id:     "sub-1",
+			ctx:    t.Context(),
+			cancel: func() {},
+			keys:   []string{},
+			handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
+				handlerCalled = true
+				return nil
+			},
+		})
+
+		store.fanOutAdd("not-a-configmap")
+
+		assert.False(t, handlerCalled)
+	})
+
+	t.Run("empty ConfigMap triggers no notifications", func(t *testing.T) {
+		store := newTestStore(t)
+		store.metadata = metadata{ConfigMapName: "my-config"}
+
+		handlerCalled := false
+		store.registry.add(&subscriber{
+			id:     "sub-1",
+			ctx:    t.Context(),
+			cancel: func() {},
+			keys:   []string{},
+			handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
+				handlerCalled = true
+				return nil
+			},
+		})
+
+		store.fanOutAdd(&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"},
+		})
+
+		assert.False(t, handlerCalled)
+	})
+}
+
 func TestSubscribe_InitialState(t *testing.T) {
 	cm := testConfigMap()
 	store := newTestStore(t, cm)
-	store.metadata = metadata{ConfigMapName: "my-config", Namespace: ptr.Of("default")}
+	store.metadata = metadata{ConfigMapName: "my-config"}
 
 	receivedCh := make(chan *configuration.UpdateEvent, 1)
 	_, err := store.Subscribe(t.Context(), &configuration.SubscribeRequest{

@@ -10,14 +10,6 @@ urls:
     url: https://docs.dapr.io/reference/components-reference/supported-configuration-stores/kubernetes-configmap-configuration-store/
 capabilities: []
 metadata:
-  - name: namespace
-    required: false
-    description: |
-      The Kubernetes namespace of the ConfigMap. Falls back to the NAMESPACE
-      environment variable, then to "default".
-    example: "my-namespace"
-    default: "default"
-    type: string
   - name: configMapName
     required: true
     description: |

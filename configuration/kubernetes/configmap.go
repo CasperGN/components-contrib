@@ -30,6 +30,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
@@ -48,6 +50,7 @@ var _ configuration.Store = (*ConfigurationStore)(nil)
 type ConfigurationStore struct {
 	kubeClient kubernetes.Interface
 	metadata   metadata
+	namespace  string
 	logger     logger.Logger
 
 	registry *subscriptionRegistry
@@ -73,12 +76,12 @@ func (s *ConfigurationStore) Init(_ context.Context, meta configuration.Metadata
 		return fmt.Errorf("failed to parse metadata: %w", err)
 	}
 
+	s.namespace = resolveNamespace()
+
 	if s.kubeClient == nil {
 		kubeconfigPath := ""
 		if s.metadata.KubeconfigPath != nil {
 			kubeconfigPath = *s.metadata.KubeconfigPath
-		} else {
-			kubeconfigPath = kubeclient.GetKubeconfigPath(s.logger, os.Args)
 		}
 
 		client, err := kubeclient.GetKubeClient(kubeconfigPath)
@@ -88,14 +91,15 @@ func (s *ConfigurationStore) Init(_ context.Context, meta configuration.Metadata
 		s.kubeClient = client
 	}
 
-	s.startInformer()
+	if err := s.startInformer(); err != nil {
+		return fmt.Errorf("failed to start informer: %w", err)
+	}
 
 	return nil
 }
 
 func (s *ConfigurationStore) Get(ctx context.Context, req *configuration.GetRequest) (*configuration.GetResponse, error) {
-	ns := s.resolveNamespace(req.Metadata)
-	cm, err := s.kubeClient.CoreV1().ConfigMaps(ns).Get(ctx, s.metadata.ConfigMapName, metav1.GetOptions{})
+	cm, err := s.kubeClient.CoreV1().ConfigMaps(s.namespace).Get(ctx, s.metadata.ConfigMapName, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get ConfigMap %q: %w", s.metadata.ConfigMapName, err)
 	}
@@ -162,12 +166,12 @@ func (s *ConfigurationStore) Subscribe(ctx context.Context, req *configuration.S
 	// blocks until Subscribe returns (to send the subscription ID first), so
 	// calling the handler synchronously here would deadlock.
 	go func() {
-		resp, err := s.Get(ctx, &configuration.GetRequest{
+		resp, err := s.Get(childCtx, &configuration.GetRequest{
 			Keys:     req.Keys,
 			Metadata: req.Metadata,
 		})
 		if err == nil && len(resp.Items) > 0 {
-			if hErr := handler(ctx, &configuration.UpdateEvent{
+			if hErr := handler(childCtx, &configuration.UpdateEvent{
 				ID:    subscribeID,
 				Items: resp.Items,
 			}); hErr != nil {
@@ -181,34 +185,38 @@ func (s *ConfigurationStore) Subscribe(ctx context.Context, req *configuration.S
 
 // startInformer starts a single informer that watches the configured ConfigMap
 // and fans out change events to all registered subscribers.
-func (s *ConfigurationStore) startInformer() {
+func (s *ConfigurationStore) startInformer() error {
 	// The informer must outlive the Init context (which is request-scoped), so
 	// we create a dedicated context controlled by s.informerCancel that lives
 	// until Close() is called.
 	ctx, cancel := context.WithCancel(context.Background())
 	s.informerCancel = cancel
 
-	ns := s.resolveNamespace(nil)
-
 	var resyncPeriod time.Duration
 	if s.metadata.ResyncPeriod != nil {
 		resyncPeriod = *s.metadata.ResyncPeriod
 	}
 
-	watchlist := cache.NewFilteredListWatchFromClient(
-		s.kubeClient.CoreV1().RESTClient(),
-		"configmaps",
-		ns,
-		func(options *metav1.ListOptions) {
-			options.FieldSelector = fields.OneTermEqualSelector("metadata.name", s.metadata.ConfigMapName).String()
+	fieldSelector := fields.OneTermEqualSelector("metadata.name", s.metadata.ConfigMapName).String()
+	watchlist := &cache.ListWatch{
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			options.FieldSelector = fieldSelector
+			return s.kubeClient.CoreV1().ConfigMaps(s.namespace).List(ctx, options)
 		},
-	)
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			options.FieldSelector = fieldSelector
+			return s.kubeClient.CoreV1().ConfigMaps(s.namespace).Watch(ctx, options)
+		},
+	}
 
 	_, controller := cache.NewInformerWithOptions(cache.InformerOptions{
 		ListerWatcher: watchlist,
 		ObjectType:    &corev1.ConfigMap{},
 		ResyncPeriod:  resyncPeriod,
 		Handler: cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj any) {
+				s.fanOutAdd(obj)
+			},
 			UpdateFunc: func(oldObj, newObj any) {
 				s.fanOutUpdate(oldObj, newObj)
 			},
@@ -221,6 +229,30 @@ func (s *ConfigurationStore) startInformer() {
 		controller.Run(ctx.Done())
 		s.logger.Info("ConfigMap informer stopped")
 	}()
+
+	if !cache.WaitForCacheSync(ctx.Done(), controller.HasSynced) {
+		cancel()
+		s.informerWg.Wait()
+		return fmt.Errorf("failed to sync informer cache for ConfigMap %q", s.metadata.ConfigMapName)
+	}
+
+	return nil
+}
+
+// fanOutAdd dispatches all items from a newly created ConfigMap to subscribers.
+func (s *ConfigurationStore) fanOutAdd(obj any) {
+	cm, ok := obj.(*corev1.ConfigMap)
+	if !ok {
+		s.logger.Warn("received non-ConfigMap object in add handler")
+		return
+	}
+
+	items := configMapToItems(cm)
+	if len(items) == 0 {
+		return
+	}
+
+	s.dispatchToSubscribers(items)
 }
 
 // fanOutUpdate dispatches ConfigMap change events to all registered subscribers.
@@ -241,52 +273,103 @@ func (s *ConfigurationStore) fanOutUpdate(oldObj, newObj any) {
 		return
 	}
 
-	// Compute all changed items once, then filter per subscriber.
 	allChanged := computeChangedItems(oldCM, newCM)
 	if len(allChanged) == 0 {
 		return
 	}
 
-	s.registry.mu.RLock()
-	defer s.registry.mu.RUnlock()
+	s.dispatchToSubscribers(allChanged)
+}
 
-	// Build per-subscriber item sets using the key index.
-	perSub := make(map[string]map[string]*configuration.Item)
-
-	for id := range s.registry.allKeys {
-		perSub[id] = allChanged
+// dispatchToSubscribers snapshots subscribers under a read lock, then dispatches
+// items concurrently without holding the lock. This prevents deadlock if a
+// handler calls Unsubscribe.
+func (s *ConfigurationStore) dispatchToSubscribers(allItems map[string]*configuration.Item) {
+	type subSnapshot struct {
+		id      string
+		handler configuration.UpdateHandler
+		ctx     context.Context
+		items   map[string]*configuration.Item
 	}
 
-	for changedKey, item := range allChanged {
+	var snapshots []subSnapshot
+
+	// Snapshot under lock.
+	s.registry.mu.RLock()
+
+	for _, sub := range s.registry.allKeys {
+		if sub.ctx.Err() != nil {
+			continue
+		}
+		itemsCopy := make(map[string]*configuration.Item, len(allItems))
+		maps.Copy(itemsCopy, allItems)
+		snapshots = append(snapshots, subSnapshot{
+			id: sub.id, handler: sub.handler, ctx: sub.ctx, items: itemsCopy,
+		})
+	}
+
+	for changedKey, item := range allItems {
 		if subs, ok := s.registry.byKey[changedKey]; ok {
-			for id := range subs {
-				if _, exists := perSub[id]; !exists {
-					perSub[id] = make(map[string]*configuration.Item)
+			for _, sub := range subs {
+				if sub.ctx.Err() != nil {
+					continue
 				}
-				perSub[id][changedKey] = item
+				// Find or create this subscriber's snapshot.
+				found := false
+				for i := range snapshots {
+					if snapshots[i].id == sub.id {
+						snapshots[i].items[changedKey] = item
+						found = true
+						break
+					}
+				}
+				if !found {
+					snapshots = append(snapshots, subSnapshot{
+						id: sub.id, handler: sub.handler, ctx: sub.ctx,
+						items: map[string]*configuration.Item{changedKey: item},
+					})
+				}
 			}
 		}
 	}
 
-	// Dispatch to each subscriber concurrently.
+	s.registry.mu.RUnlock()
+
+	// Dispatch without holding any lock.
 	var wg sync.WaitGroup
-	for subID, items := range perSub {
-		sub := s.registry.byID[subID]
-		if sub.ctx.Err() != nil {
-			continue
-		}
+	for _, snap := range snapshots {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := sub.handler(sub.ctx, &configuration.UpdateEvent{
-				ID:    subID,
-				Items: items,
+			if err := snap.handler(snap.ctx, &configuration.UpdateEvent{
+				ID:    snap.id,
+				Items: snap.items,
 			}); err != nil {
-				s.logger.Errorf("subscription %s handler error: %v", subID, err)
+				s.logger.Errorf("subscription %s handler error: %v", snap.id, err)
 			}
 		}()
 	}
 	wg.Wait()
+}
+
+// configMapToItems builds configuration items from all data in a ConfigMap.
+func configMapToItems(cm *corev1.ConfigMap) map[string]*configuration.Item {
+	items := make(map[string]*configuration.Item, len(cm.Data)+len(cm.BinaryData))
+	for k, v := range cm.Data {
+		items[k] = &configuration.Item{
+			Value:    v,
+			Version:  cm.ResourceVersion,
+			Metadata: map[string]string{},
+		}
+	}
+	for k, v := range cm.BinaryData {
+		items[k] = &configuration.Item{
+			Value:    base64.StdEncoding.EncodeToString(v),
+			Version:  cm.ResourceVersion,
+			Metadata: map[string]string{"encoding": "base64"},
+		}
+	}
+	return items
 }
 
 // computeChangedItems computes the set of configuration items that changed
@@ -377,13 +460,7 @@ func (s *ConfigurationStore) Close() error {
 	return nil
 }
 
-func (s *ConfigurationStore) resolveNamespace(requestMetadata map[string]string) string {
-	if ns, ok := requestMetadata["namespace"]; ok && ns != "" {
-		return ns
-	}
-	if s.metadata.Namespace != nil {
-		return *s.metadata.Namespace
-	}
+func resolveNamespace() string {
 	if ns, ok := os.LookupEnv("NAMESPACE"); ok {
 		return ns
 	}

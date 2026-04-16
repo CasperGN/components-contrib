@@ -6,7 +6,5 @@ spec:
   type: configuration.kubernetes
   version: v1
   metadata:
-  - name: namespace
-    value: "default"
   - name: configMapName
     value: "dapr-conf-test"
