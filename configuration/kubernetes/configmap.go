@@ -93,7 +93,7 @@ func (s *ConfigurationStore) Init(_ context.Context, meta configuration.Metadata
 		s.kubeClient = client
 	}
 
-	if err := s.startInformer(); err != nil {
+	if err := s.startInformer(ctx); err != nil {
 		return fmt.Errorf("failed to start informer: %w", err)
 	}
 
