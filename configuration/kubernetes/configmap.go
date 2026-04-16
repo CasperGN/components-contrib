@@ -270,10 +270,6 @@ func (s *ConfigurationStore) fanOutUpdate(oldObj, newObj any) {
 	if oldCM.ResourceVersion == newCM.ResourceVersion {
 		return
 	}
-	if maps.Equal(oldCM.Data, newCM.Data) &&
-		maps.EqualFunc(oldCM.BinaryData, newCM.BinaryData, bytes.Equal) {
-		return
-	}
 
 	allChanged := computeChangedItems(oldCM, newCM)
 	if len(allChanged) == 0 {
