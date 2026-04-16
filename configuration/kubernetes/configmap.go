@@ -82,6 +82,8 @@ func (s *ConfigurationStore) Init(_ context.Context, meta configuration.Metadata
 		kubeconfigPath := ""
 		if s.metadata.KubeconfigPath != nil {
 			kubeconfigPath = *s.metadata.KubeconfigPath
+		} else {
+			kubeconfigPath = kubeclient.GetKubeconfigPath(s.logger, os.Args)
 		}
 
 		client, err := kubeclient.GetKubeClient(kubeconfigPath)
@@ -292,10 +294,10 @@ func (s *ConfigurationStore) dispatchToSubscribers(allItems map[string]*configur
 		items   map[string]*configuration.Item
 	}
 
-	var snapshots []subSnapshot
-
 	// Snapshot under lock.
 	s.registry.mu.RLock()
+
+	snapshots := make([]subSnapshot, 0, len(s.registry.byID))
 
 	for _, sub := range s.registry.allKeys {
 		if sub.ctx.Err() != nil {
