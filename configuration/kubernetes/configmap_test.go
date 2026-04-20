@@ -16,9 +16,6 @@ package kubernetes
 import (
 	"context"
 	"encoding/base64"
-	"fmt"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,31 +31,33 @@ import (
 	"github.com/dapr/kit/logger"
 )
 
-func newTestStore(t *testing.T, objects ...corev1.ConfigMap) *ConfigurationStore {
+// newTestStoreWithInformer creates a ConfigurationStore backed by a fake
+// Kubernetes client and a real SharedIndexInformer. The informer is started
+// and synced before the function returns.
+func newTestStoreWithInformer(t *testing.T, objects ...corev1.ConfigMap) *ConfigurationStore {
 	t.Helper()
-
-	// Namespace is derived from the NAMESPACE env var (set by daprd via
-	// downward API). Default to "default" for tests.
 	t.Setenv("NAMESPACE", "default")
 
 	fakeClient := fake.NewSimpleClientset()
-	informerStore := cache.NewStore(cache.MetaNamespaceKeyFunc)
-
 	for i := range objects {
 		_, err := fakeClient.CoreV1().ConfigMaps(objects[i].Namespace).Create(
 			t.Context(), &objects[i], metav1.CreateOptions{},
 		)
 		require.NoError(t, err)
-		require.NoError(t, informerStore.Add(&objects[i]))
 	}
 
-	return &ConfigurationStore{
+	store := &ConfigurationStore{
 		kubeClient:    fakeClient,
-		informerStore: informerStore,
 		namespace:     "default",
 		logger:        logger.NewLogger("test"),
-		registry:      newSubscriptionRegistry(),
+		subscriptions: make(map[string]*subscription),
+		metadata:      metadata{ConfigMapName: "my-config"},
 	}
+
+	require.NoError(t, store.startInformer(t.Context()))
+	t.Cleanup(func() { store.Close() })
+
+	return store
 }
 
 func testConfigMap() corev1.ConfigMap {
@@ -162,8 +161,14 @@ func TestMetadata_Parse(t *testing.T) {
 }
 
 func TestInit_ValidMetadata(t *testing.T) {
-	store := newTestStore(t)
 	t.Setenv("NAMESPACE", "default")
+	fakeClient := fake.NewSimpleClientset()
+
+	store := &ConfigurationStore{
+		kubeClient:    fakeClient,
+		logger:        logger.NewLogger("test"),
+		subscriptions: make(map[string]*subscription),
+	}
 
 	err := store.Init(t.Context(), configuration.Metadata{
 		Base: contribMetadata.Base{
@@ -174,13 +179,14 @@ func TestInit_ValidMetadata(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "my-config", store.metadata.ConfigMapName)
-
-	// Clean up informer started by Init.
 	require.NoError(t, store.Close())
 }
 
 func TestInit_InvalidMetadata(t *testing.T) {
-	store := newTestStore(t)
+	store := &ConfigurationStore{
+		logger:        logger.NewLogger("test"),
+		subscriptions: make(map[string]*subscription),
+	}
 
 	err := store.Init(t.Context(), configuration.Metadata{
 		Base: contribMetadata.Base{
@@ -192,9 +198,7 @@ func TestInit_InvalidMetadata(t *testing.T) {
 }
 
 func TestGet_AllKeys(t *testing.T) {
-	cm := testConfigMap()
-	store := newTestStore(t, cm)
-	store.metadata = metadata{ConfigMapName: "my-config"}
+	store := newTestStoreWithInformer(t, testConfigMap())
 
 	resp, err := store.Get(t.Context(), &configuration.GetRequest{
 		Keys:     []string{},
@@ -208,9 +212,7 @@ func TestGet_AllKeys(t *testing.T) {
 }
 
 func TestGet_SpecificKeys(t *testing.T) {
-	cm := testConfigMap()
-	store := newTestStore(t, cm)
-	store.metadata = metadata{ConfigMapName: "my-config"}
+	store := newTestStoreWithInformer(t, testConfigMap())
 
 	resp, err := store.Get(t.Context(), &configuration.GetRequest{
 		Keys:     []string{"log.level"},
@@ -222,9 +224,7 @@ func TestGet_SpecificKeys(t *testing.T) {
 }
 
 func TestGet_MissingKeys(t *testing.T) {
-	cm := testConfigMap()
-	store := newTestStore(t, cm)
-	store.metadata = metadata{ConfigMapName: "my-config"}
+	store := newTestStoreWithInformer(t, testConfigMap())
 
 	resp, err := store.Get(t.Context(), &configuration.GetRequest{
 		Keys:     []string{"nonexistent.key"},
@@ -248,8 +248,7 @@ func TestGet_BinaryData(t *testing.T) {
 			"binary-key": {0x01, 0x02, 0x03},
 		},
 	}
-	store := newTestStore(t, cm)
-	store.metadata = metadata{ConfigMapName: "my-config"}
+	store := newTestStoreWithInformer(t, cm)
 
 	t.Run("get all includes binary data", func(t *testing.T) {
 		resp, err := store.Get(t.Context(), &configuration.GetRequest{
@@ -285,8 +284,7 @@ func TestGet_EmptyConfigMap(t *testing.T) {
 			Namespace: "default",
 		},
 	}
-	store := newTestStore(t, cm)
-	store.metadata = metadata{ConfigMapName: "my-config"}
+	store := newTestStoreWithInformer(t, cm)
 
 	resp, err := store.Get(t.Context(), &configuration.GetRequest{
 		Keys:     []string{},
@@ -297,8 +295,7 @@ func TestGet_EmptyConfigMap(t *testing.T) {
 }
 
 func TestGet_ConfigMapNotFound(t *testing.T) {
-	store := newTestStore(t)
-	store.metadata = metadata{ConfigMapName: "missing"}
+	store := newTestStoreWithInformer(t) // no ConfigMap created
 
 	resp, err := store.Get(t.Context(), &configuration.GetRequest{
 		Keys:     []string{},
@@ -309,73 +306,39 @@ func TestGet_ConfigMapNotFound(t *testing.T) {
 }
 
 func TestUnsubscribe_Valid(t *testing.T) {
-	store := newTestStore(t)
-	store.metadata = metadata{ConfigMapName: "my-config"}
+	store := newTestStoreWithInformer(t, testConfigMap())
 
-	cancelled := false
-	store.registry.add(&subscriber{
-		id:     "test-sub-id",
-		ctx:    t.Context(),
-		cancel: func() { cancelled = true },
-		keys:   []string{},
-		handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
-			return nil
-		},
+	subID, err := store.Subscribe(t.Context(), &configuration.SubscribeRequest{
+		Keys:     []string{"log.level"},
+		Metadata: map[string]string{},
+	}, func(_ context.Context, _ *configuration.UpdateEvent) error {
+		return nil
 	})
-
-	err := store.Unsubscribe(t.Context(), &configuration.UnsubscribeRequest{ID: "test-sub-id"})
 	require.NoError(t, err)
-	assert.True(t, cancelled)
+
+	err = store.Unsubscribe(t.Context(), &configuration.UnsubscribeRequest{ID: subID})
+	require.NoError(t, err)
+
+	// Second unsubscribe should fail.
+	err = store.Unsubscribe(t.Context(), &configuration.UnsubscribeRequest{ID: subID})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not exist")
 }
 
 func TestUnsubscribe_InvalidID(t *testing.T) {
-	store := newTestStore(t)
-	store.metadata = metadata{ConfigMapName: "my-config"}
+	store := newTestStoreWithInformer(t)
 
 	err := store.Unsubscribe(t.Context(), &configuration.UnsubscribeRequest{ID: "nonexistent"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "does not exist")
 }
 
-func TestClose_CancelsAllSubscriptions(t *testing.T) {
-	store := newTestStore(t)
-	store.metadata = metadata{ConfigMapName: "my-config"}
-
-	var mu sync.Mutex
-	cancelledIDs := []string{}
-
-	for _, id := range []string{"sub-1", "sub-2", "sub-3"} {
-		capturedID := id
-		store.registry.add(&subscriber{
-			id:  id,
-			ctx: t.Context(),
-			cancel: func() {
-				mu.Lock()
-				cancelledIDs = append(cancelledIDs, capturedID)
-				mu.Unlock()
-			},
-			keys: []string{},
-			handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
-				return nil
-			},
-		})
-	}
-
-	err := store.Close()
-	require.NoError(t, err)
-	assert.Len(t, cancelledIDs, 3)
-	assert.ElementsMatch(t, []string{"sub-1", "sub-2", "sub-3"}, cancelledIDs)
-}
-
 func TestClose_PreventsFurtherSubscriptions(t *testing.T) {
-	cm := testConfigMap()
-	store := newTestStore(t, cm)
-	store.metadata = metadata{ConfigMapName: "my-config"}
+	store := newTestStoreWithInformer(t, testConfigMap())
 
-	err := store.Close()
-	require.NoError(t, err)
+	require.NoError(t, store.Close())
 
-	_, err = store.Subscribe(t.Context(), &configuration.SubscribeRequest{
+	_, err := store.Subscribe(t.Context(), &configuration.SubscribeRequest{
 		Keys:     []string{"log.level"},
 		Metadata: map[string]string{},
 	}, func(_ context.Context, _ *configuration.UpdateEvent) error {
@@ -398,8 +361,8 @@ func TestResolveNamespace(t *testing.T) {
 
 func TestGetComponentMetadata(t *testing.T) {
 	store := &ConfigurationStore{
-		logger:   logger.NewLogger("test"),
-		registry: newSubscriptionRegistry(),
+		logger:        logger.NewLogger("test"),
+		subscriptions: make(map[string]*subscription),
 	}
 	metadataInfo := store.GetComponentMetadata()
 	assert.NotNil(t, metadataInfo)
@@ -504,530 +467,257 @@ func TestComputeChangedItems(t *testing.T) {
 	})
 }
 
-func TestFanOutUpdate(t *testing.T) {
-	t.Run("dispatches to multiple subscribers", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config"}
-
-		var mu sync.Mutex
-		receivedByID := map[string]*configuration.UpdateEvent{}
-
-		for _, id := range []string{"sub-1", "sub-2"} {
-			capturedID := id
-			store.registry.add(&subscriber{
-				id:     id,
-				ctx:    t.Context(),
-				cancel: func() {},
-				keys:   []string{},
-				handler: func(_ context.Context, e *configuration.UpdateEvent) error {
-					mu.Lock()
-					receivedByID[capturedID] = e
-					mu.Unlock()
-					return nil
-				},
-			})
-		}
-
-		oldCM := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"},
-			Data:       map[string]string{"key1": "old"},
-		}
-		newCM := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "2"},
-			Data:       map[string]string{"key1": "new"},
-		}
-
-		store.fanOutUpdate(oldCM, newCM)
-
-		assert.Len(t, receivedByID, 2)
-		assert.Equal(t, "sub-1", receivedByID["sub-1"].ID)
-		assert.Equal(t, "sub-2", receivedByID["sub-2"].ID)
-		assert.Equal(t, "new", receivedByID["sub-1"].Items["key1"].Value)
-	})
-
-	t.Run("filters per subscriber key set", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config"}
-
-		var mu sync.Mutex
-		receivedByID := map[string]*configuration.UpdateEvent{}
-
-		store.registry.add(&subscriber{
-			id:     "sub-key1",
-			ctx:    t.Context(),
-			cancel: func() {},
-			keys:   []string{"key1"},
-			handler: func(_ context.Context, e *configuration.UpdateEvent) error {
-				mu.Lock()
-				receivedByID["sub-key1"] = e
-				mu.Unlock()
-				return nil
-			},
-		})
-		store.registry.add(&subscriber{
-			id:     "sub-key2",
-			ctx:    t.Context(),
-			cancel: func() {},
-			keys:   []string{"key2"},
-			handler: func(_ context.Context, e *configuration.UpdateEvent) error {
-				mu.Lock()
-				receivedByID["sub-key2"] = e
-				mu.Unlock()
-				return nil
-			},
-		})
-
-		oldCM := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"},
-			Data:       map[string]string{"key1": "old1", "key2": "old2"},
-		}
-		newCM := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "2"},
-			Data:       map[string]string{"key1": "new1", "key2": "old2"}, // only key1 changed
-		}
-
-		store.fanOutUpdate(oldCM, newCM)
-
-		assert.Contains(t, receivedByID, "sub-key1")
-		assert.NotContains(t, receivedByID, "sub-key2") // key2 didn't change
-	})
-
-	t.Run("skips cancelled subscribers", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config"}
-
-		cancelledCtx, cancel := context.WithCancel(t.Context())
-		cancel() // cancel immediately
-
-		handlerCalled := false
-		store.registry.add(&subscriber{
-			id:     "cancelled-sub",
-			ctx:    cancelledCtx,
-			cancel: cancel,
-			keys:   []string{},
-			handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
-				handlerCalled = true
-				return nil
-			},
-		})
-
-		oldCM := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"},
-			Data:       map[string]string{"key1": "old"},
-		}
-		newCM := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "2"},
-			Data:       map[string]string{"key1": "new"},
-		}
-
-		store.fanOutUpdate(oldCM, newCM)
-
-		assert.False(t, handlerCalled)
-	})
-
-	t.Run("non-ConfigMap objects are ignored", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config"}
-
-		handlerCalled := false
-		store.registry.add(&subscriber{
-			id:     "sub-1",
-			ctx:    t.Context(),
-			cancel: func() {},
-			keys:   []string{},
-			handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
-				handlerCalled = true
-				return nil
-			},
-		})
-
-		store.fanOutUpdate("not-a-configmap", "not-a-configmap")
-
-		assert.False(t, handlerCalled)
-	})
-
-	t.Run("same ResourceVersion is skipped", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config"}
-
-		handlerCalled := false
-		store.registry.add(&subscriber{
-			id:     "sub-1",
-			ctx:    t.Context(),
-			cancel: func() {},
-			keys:   []string{},
-			handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
-				handlerCalled = true
-				return nil
-			},
-		})
-
-		cm := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"},
-			Data:       map[string]string{"key1": "val"},
-		}
-
-		store.fanOutUpdate(cm, cm)
-
-		assert.False(t, handlerCalled)
-	})
-
-	t.Run("data unchanged is skipped despite different ResourceVersion", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config"}
-
-		handlerCalled := false
-		store.registry.add(&subscriber{
-			id:     "sub-1",
-			ctx:    t.Context(),
-			cancel: func() {},
-			keys:   []string{},
-			handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
-				handlerCalled = true
-				return nil
-			},
-		})
-
-		oldCM := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"},
-			Data:       map[string]string{"key1": "val"},
-		}
-		newCM := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "2"},
-			Data:       map[string]string{"key1": "val"},
-		}
-
-		store.fanOutUpdate(oldCM, newCM)
-
-		assert.False(t, handlerCalled)
-	})
-
-	t.Run("concurrent dispatch to subscribers", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config"}
-
-		var maxConcurrent atomic.Int32
-		var currentConcurrent atomic.Int32
-		doneCh := make(chan struct{})
-
-		for i := range 5 {
-			id := fmt.Sprintf("sub-%d", i)
-			store.registry.add(&subscriber{
-				id:     id,
-				ctx:    t.Context(),
-				cancel: func() {},
-				keys:   []string{},
-				handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
-					cur := currentConcurrent.Add(1)
-					for {
-						old := maxConcurrent.Load()
-						if cur <= old || maxConcurrent.CompareAndSwap(old, cur) {
-							break
-						}
-					}
-					<-doneCh
-					currentConcurrent.Add(-1)
-					return nil
-				},
-			})
-		}
-
-		go func() {
-			oldCM := &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"},
-				Data:       map[string]string{"key1": "old"},
-			}
-			newCM := &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{ResourceVersion: "2"},
-				Data:       map[string]string{"key1": "new"},
-			}
-			store.fanOutUpdate(oldCM, newCM)
-		}()
-
-		// Wait for at least 2 handlers to be running concurrently.
-		require.Eventually(t, func() bool {
-			return maxConcurrent.Load() >= 2
-		}, 2*time.Second, 10*time.Millisecond)
-
-		close(doneCh)
-	})
-}
-
-func TestFanOutUpdate_HandlerCanUnsubscribeWithoutDeadlock(t *testing.T) {
-	store := newTestStore(t)
-	store.metadata = metadata{ConfigMapName: "my-config"}
-
-	doneCh := make(chan struct{})
-	store.registry.add(&subscriber{
-		id:     "self-unsub",
-		ctx:    t.Context(),
-		cancel: func() {},
-		keys:   []string{},
-		handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
-			// Calling Unsubscribe from within a handler would deadlock if
-			// fanOutUpdate held the lock during dispatch.
-			_ = store.Unsubscribe(t.Context(), &configuration.UnsubscribeRequest{ID: "self-unsub"})
-			close(doneCh)
-			return nil
-		},
-	})
-
-	go store.fanOutUpdate(
-		&corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"},
-			Data:       map[string]string{"key1": "old"},
-		},
-		&corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "2"},
-			Data:       map[string]string{"key1": "new"},
-		},
-	)
-
-	select {
-	case <-doneCh:
-		// Success — no deadlock.
-	case <-time.After(5 * time.Second):
-		t.Fatal("deadlock: fanOutUpdate did not complete within 5s")
-	}
-}
-
-func TestFanOutAdd(t *testing.T) {
-	t.Run("notifies all-key subscribers on ConfigMap creation", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config"}
-
+func TestSubscriberHandler_OnAdd(t *testing.T) {
+	t.Run("delivers all keys", func(t *testing.T) {
 		receivedCh := make(chan *configuration.UpdateEvent, 1)
-		store.registry.add(&subscriber{
-			id:     "sub-all",
-			ctx:    t.Context(),
-			cancel: func() {},
-			keys:   []string{},
-			handler: func(_ context.Context, e *configuration.UpdateEvent) error {
-				receivedCh <- e
-				return nil
-			},
-		})
+		h := &subscriberHandler{
+			id:      "sub-1",
+			keys:    []string{},
+			handler: func(_ context.Context, e *configuration.UpdateEvent) error { receivedCh <- e; return nil },
+			ctx:     t.Context(),
+			logger:  logger.NewLogger("test"),
+		}
 
-		store.fanOutAdd(&corev1.ConfigMap{
+		h.OnAdd(&corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"},
 			Data:       map[string]string{"key1": "val1", "key2": "val2"},
-		})
+		}, false)
 
 		select {
-		case received := <-receivedCh:
-			assert.Len(t, received.Items, 2)
-			assert.Equal(t, "val1", received.Items["key1"].Value)
-			assert.Equal(t, "val2", received.Items["key2"].Value)
+		case e := <-receivedCh:
+			assert.Len(t, e.Items, 2)
+			assert.Equal(t, "val1", e.Items["key1"].Value)
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for add notification")
+			t.Fatal("timed out")
 		}
 	})
 
-	t.Run("filters per subscriber key set on add", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config"}
+	t.Run("filters by subscribed keys", func(t *testing.T) {
+		receivedCh := make(chan *configuration.UpdateEvent, 1)
+		h := &subscriberHandler{
+			id:      "sub-1",
+			keys:    []string{"key1"},
+			handler: func(_ context.Context, e *configuration.UpdateEvent) error { receivedCh <- e; return nil },
+			ctx:     t.Context(),
+			logger:  logger.NewLogger("test"),
+		}
 
-		var mu sync.Mutex
-		receivedByID := map[string]*configuration.UpdateEvent{}
-
-		store.registry.add(&subscriber{
-			id:     "sub-key1",
-			ctx:    t.Context(),
-			cancel: func() {},
-			keys:   []string{"key1"},
-			handler: func(_ context.Context, e *configuration.UpdateEvent) error {
-				mu.Lock()
-				receivedByID["sub-key1"] = e
-				mu.Unlock()
-				return nil
-			},
-		})
-		store.registry.add(&subscriber{
-			id:     "sub-key3",
-			ctx:    t.Context(),
-			cancel: func() {},
-			keys:   []string{"key3"},
-			handler: func(_ context.Context, e *configuration.UpdateEvent) error {
-				mu.Lock()
-				receivedByID["sub-key3"] = e
-				mu.Unlock()
-				return nil
-			},
-		})
-
-		store.fanOutAdd(&corev1.ConfigMap{
+		h.OnAdd(&corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"},
 			Data:       map[string]string{"key1": "val1", "key2": "val2"},
-		})
+		}, false)
 
-		// sub-key1 gets key1; sub-key3 gets nothing (key3 not in ConfigMap).
-		require.Eventually(t, func() bool {
-			mu.Lock()
-			defer mu.Unlock()
-			return len(receivedByID) > 0
-		}, 2*time.Second, 10*time.Millisecond)
-
-		mu.Lock()
-		defer mu.Unlock()
-		assert.Contains(t, receivedByID, "sub-key1")
-		assert.Len(t, receivedByID["sub-key1"].Items, 1)
-		assert.NotContains(t, receivedByID, "sub-key3")
+		select {
+		case e := <-receivedCh:
+			assert.Len(t, e.Items, 1)
+			assert.Equal(t, "val1", e.Items["key1"].Value)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out")
+		}
 	})
 
-	t.Run("skips cancelled subscribers", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config"}
+	t.Run("skips when no matching keys", func(t *testing.T) {
+		handlerCalled := false
+		h := &subscriberHandler{
+			id:      "sub-1",
+			keys:    []string{"nonexistent"},
+			handler: func(_ context.Context, _ *configuration.UpdateEvent) error { handlerCalled = true; return nil },
+			ctx:     t.Context(),
+			logger:  logger.NewLogger("test"),
+		}
 
-		cancelledCtx, cancel := context.WithCancel(t.Context())
+		h.OnAdd(&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"},
+			Data:       map[string]string{"key1": "val1"},
+		}, false)
+
+		assert.False(t, handlerCalled)
+	})
+
+	t.Run("skips cancelled context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
 
 		handlerCalled := false
-		store.registry.add(&subscriber{
-			id:     "cancelled-sub",
-			ctx:    cancelledCtx,
-			cancel: cancel,
-			keys:   []string{},
-			handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
-				handlerCalled = true
-				return nil
-			},
-		})
+		h := &subscriberHandler{
+			id:      "sub-1",
+			keys:    []string{},
+			handler: func(_ context.Context, _ *configuration.UpdateEvent) error { handlerCalled = true; return nil },
+			ctx:     ctx,
+			logger:  logger.NewLogger("test"),
+		}
 
-		store.fanOutAdd(&corev1.ConfigMap{
+		h.OnAdd(&corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"},
 			Data:       map[string]string{"key1": "val1"},
-		})
-
-		assert.False(t, handlerCalled)
-	})
-
-	t.Run("non-ConfigMap objects are ignored", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config"}
-
-		handlerCalled := false
-		store.registry.add(&subscriber{
-			id:     "sub-1",
-			ctx:    t.Context(),
-			cancel: func() {},
-			keys:   []string{},
-			handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
-				handlerCalled = true
-				return nil
-			},
-		})
-
-		store.fanOutAdd("not-a-configmap")
-
-		assert.False(t, handlerCalled)
-	})
-
-	t.Run("empty ConfigMap triggers no notifications", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config"}
-
-		handlerCalled := false
-		store.registry.add(&subscriber{
-			id:     "sub-1",
-			ctx:    t.Context(),
-			cancel: func() {},
-			keys:   []string{},
-			handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
-				handlerCalled = true
-				return nil
-			},
-		})
-
-		store.fanOutAdd(&corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"},
-		})
+		}, false)
 
 		assert.False(t, handlerCalled)
 	})
 }
 
-func TestFanOutDelete(t *testing.T) {
-	t.Run("notifies subscribers with deleted markers", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config"}
-
+func TestSubscriberHandler_OnUpdate(t *testing.T) {
+	t.Run("delivers changed keys", func(t *testing.T) {
 		receivedCh := make(chan *configuration.UpdateEvent, 1)
-		store.registry.add(&subscriber{
-			id:     "sub-all",
-			ctx:    t.Context(),
-			cancel: func() {},
-			keys:   []string{},
-			handler: func(_ context.Context, e *configuration.UpdateEvent) error {
-				receivedCh <- e
-				return nil
-			},
-		})
+		h := &subscriberHandler{
+			id:      "sub-1",
+			keys:    []string{},
+			handler: func(_ context.Context, e *configuration.UpdateEvent) error { receivedCh <- e; return nil },
+			ctx:     t.Context(),
+			logger:  logger.NewLogger("test"),
+		}
 
-		store.fanOutDelete(&corev1.ConfigMap{
+		h.OnUpdate(
+			&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"}, Data: map[string]string{"key1": "old"}},
+			&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{ResourceVersion: "2"}, Data: map[string]string{"key1": "new"}},
+		)
+
+		select {
+		case e := <-receivedCh:
+			assert.Equal(t, "new", e.Items["key1"].Value)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out")
+		}
+	})
+
+	t.Run("skips same ResourceVersion", func(t *testing.T) {
+		handlerCalled := false
+		h := &subscriberHandler{
+			id:      "sub-1",
+			keys:    []string{},
+			handler: func(_ context.Context, _ *configuration.UpdateEvent) error { handlerCalled = true; return nil },
+			ctx:     t.Context(),
+			logger:  logger.NewLogger("test"),
+		}
+
+		cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"}, Data: map[string]string{"key1": "val"}}
+		h.OnUpdate(cm, cm)
+
+		assert.False(t, handlerCalled)
+	})
+
+	t.Run("filters by subscribed keys", func(t *testing.T) {
+		handlerCalled := false
+		h := &subscriberHandler{
+			id:      "sub-1",
+			keys:    []string{"key2"},
+			handler: func(_ context.Context, _ *configuration.UpdateEvent) error { handlerCalled = true; return nil },
+			ctx:     t.Context(),
+			logger:  logger.NewLogger("test"),
+		}
+
+		h.OnUpdate(
+			&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"}, Data: map[string]string{"key1": "old", "key2": "same"}},
+			&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{ResourceVersion: "2"}, Data: map[string]string{"key1": "new", "key2": "same"}},
+		)
+
+		// key2 didn't change, so handler should not be called.
+		assert.False(t, handlerCalled)
+	})
+}
+
+func TestSubscriberHandler_OnDelete(t *testing.T) {
+	t.Run("delivers deleted markers", func(t *testing.T) {
+		receivedCh := make(chan *configuration.UpdateEvent, 1)
+		h := &subscriberHandler{
+			id:      "sub-1",
+			keys:    []string{},
+			handler: func(_ context.Context, e *configuration.UpdateEvent) error { receivedCh <- e; return nil },
+			ctx:     t.Context(),
+			logger:  logger.NewLogger("test"),
+		}
+
+		h.OnDelete(&corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "5"},
 			Data:       map[string]string{"key1": "val1", "key2": "val2"},
 		})
 
 		select {
-		case received := <-receivedCh:
-			assert.Len(t, received.Items, 2)
-			assert.Equal(t, "true", received.Items["key1"].Metadata["deleted"])
-			assert.Equal(t, "true", received.Items["key2"].Metadata["deleted"])
-			assert.Equal(t, "", received.Items["key1"].Value)
+		case e := <-receivedCh:
+			assert.Len(t, e.Items, 2)
+			assert.Equal(t, "true", e.Items["key1"].Metadata["deleted"])
+			assert.Equal(t, "", e.Items["key1"].Value)
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for delete notification")
+			t.Fatal("timed out")
 		}
 	})
 
-	t.Run("empty ConfigMap triggers no notifications", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config"}
+	t.Run("handles DeletedFinalStateUnknown", func(t *testing.T) {
+		receivedCh := make(chan *configuration.UpdateEvent, 1)
+		h := &subscriberHandler{
+			id:      "sub-1",
+			keys:    []string{},
+			handler: func(_ context.Context, e *configuration.UpdateEvent) error { receivedCh <- e; return nil },
+			ctx:     t.Context(),
+			logger:  logger.NewLogger("test"),
+		}
 
-		handlerCalled := false
-		store.registry.add(&subscriber{
-			id:     "sub-1",
-			ctx:    t.Context(),
-			cancel: func() {},
-			keys:   []string{},
-			handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
-				handlerCalled = true
-				return nil
+		h.OnDelete(cache.DeletedFinalStateUnknown{
+			Key: "default/my-config",
+			Obj: &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{ResourceVersion: "5"},
+				Data:       map[string]string{"key1": "val1"},
 			},
 		})
 
-		store.fanOutDelete(&corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{ResourceVersion: "5"},
-		})
+		select {
+		case e := <-receivedCh:
+			assert.Len(t, e.Items, 1)
+			assert.Equal(t, "true", e.Items["key1"].Metadata["deleted"])
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out")
+		}
+	})
+}
 
-		assert.False(t, handlerCalled)
+func TestExtractConfigMap(t *testing.T) {
+	t.Run("direct ConfigMap pointer", func(t *testing.T) {
+		cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "test"}}
+		assert.Equal(t, cm, extractConfigMap(cm))
 	})
 
-	t.Run("non-ConfigMap objects are ignored", func(t *testing.T) {
-		store := newTestStore(t)
-		store.metadata = metadata{ConfigMapName: "my-config"}
+	t.Run("DeletedFinalStateUnknown with ConfigMap", func(t *testing.T) {
+		cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "test"}}
+		result := extractConfigMap(cache.DeletedFinalStateUnknown{Obj: cm})
+		assert.Equal(t, cm, result)
+	})
 
-		handlerCalled := false
-		store.registry.add(&subscriber{
-			id:     "sub-1",
-			ctx:    t.Context(),
-			cancel: func() {},
-			keys:   []string{},
-			handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
-				handlerCalled = true
-				return nil
-			},
-		})
+	t.Run("non-ConfigMap returns nil", func(t *testing.T) {
+		assert.Nil(t, extractConfigMap("not-a-configmap"))
+	})
 
-		store.fanOutDelete("not-a-configmap")
+	t.Run("DeletedFinalStateUnknown with non-ConfigMap returns nil", func(t *testing.T) {
+		assert.Nil(t, extractConfigMap(cache.DeletedFinalStateUnknown{Obj: "not-a-configmap"}))
+	})
+}
 
-		assert.False(t, handlerCalled)
+func TestFilterByKeys(t *testing.T) {
+	items := map[string]*configuration.Item{
+		"key1": {Value: "val1"},
+		"key2": {Value: "val2"},
+		"key3": {Value: "val3"},
+	}
+
+	t.Run("empty keys returns all items", func(t *testing.T) {
+		result := filterByKeys(items, []string{})
+		assert.Len(t, result, 3)
+	})
+
+	t.Run("filters to specified keys", func(t *testing.T) {
+		result := filterByKeys(items, []string{"key1", "key3"})
+		assert.Len(t, result, 2)
+		assert.Contains(t, result, "key1")
+		assert.Contains(t, result, "key3")
+	})
+
+	t.Run("nonexistent keys are omitted", func(t *testing.T) {
+		result := filterByKeys(items, []string{"nonexistent"})
+		assert.Empty(t, result)
 	})
 }
 
 func TestSubscribe_InitialState(t *testing.T) {
-	cm := testConfigMap()
-	store := newTestStore(t, cm)
-	store.metadata = metadata{ConfigMapName: "my-config"}
+	store := newTestStoreWithInformer(t, testConfigMap())
 
 	receivedCh := make(chan *configuration.UpdateEvent, 1)
 	_, err := store.Subscribe(t.Context(), &configuration.SubscribeRequest{
@@ -1046,100 +736,4 @@ func TestSubscribe_InitialState(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for initial state delivery")
 	}
-
-	require.NoError(t, store.Close())
-}
-
-func TestSubscriptionRegistry(t *testing.T) {
-	t.Run("add and remove by ID", func(t *testing.T) {
-		r := newSubscriptionRegistry()
-		r.add(&subscriber{
-			id:     "s1",
-			keys:   []string{"key1"},
-			ctx:    t.Context(),
-			cancel: func() {},
-			handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
-				return nil
-			},
-		})
-
-		assert.Contains(t, r.byID, "s1")
-		assert.Contains(t, r.byKey["key1"], "s1")
-
-		sub, ok := r.remove("s1")
-		assert.True(t, ok)
-		assert.NotNil(t, sub)
-		assert.Empty(t, r.byID)
-		assert.Empty(t, r.byKey)
-	})
-
-	t.Run("all-keys subscriber indexed in allKeys", func(t *testing.T) {
-		r := newSubscriptionRegistry()
-		r.add(&subscriber{
-			id:     "s1",
-			keys:   []string{},
-			ctx:    t.Context(),
-			cancel: func() {},
-			handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
-				return nil
-			},
-		})
-
-		assert.Contains(t, r.allKeys, "s1")
-		assert.Empty(t, r.byKey)
-
-		r.remove("s1")
-		assert.Empty(t, r.allKeys)
-	})
-
-	t.Run("cancelAll cancels all subscribers", func(t *testing.T) {
-		r := newSubscriptionRegistry()
-		var count atomic.Int32
-		for i := range 3 {
-			id := fmt.Sprintf("s%d", i)
-			r.add(&subscriber{
-				id:     id,
-				keys:   []string{"k"},
-				ctx:    t.Context(),
-				cancel: func() { count.Add(1) },
-				handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
-					return nil
-				},
-			})
-		}
-
-		r.cancelAll()
-		assert.Equal(t, int32(3), count.Load())
-		assert.Empty(t, r.byID)
-		assert.Empty(t, r.byKey)
-	})
-
-	t.Run("key index maps multiple subscribers to same key", func(t *testing.T) {
-		r := newSubscriptionRegistry()
-		for _, id := range []string{"s1", "s2"} {
-			r.add(&subscriber{
-				id:     id,
-				keys:   []string{"shared-key"},
-				ctx:    t.Context(),
-				cancel: func() {},
-				handler: func(_ context.Context, _ *configuration.UpdateEvent) error {
-					return nil
-				},
-			})
-		}
-
-		assert.Len(t, r.byKey["shared-key"], 2)
-		assert.Contains(t, r.byKey["shared-key"], "s1")
-		assert.Contains(t, r.byKey["shared-key"], "s2")
-
-		r.remove("s1")
-		assert.Len(t, r.byKey["shared-key"], 1)
-		assert.Contains(t, r.byKey["shared-key"], "s2")
-	})
-
-	t.Run("remove non-existent returns false", func(t *testing.T) {
-		r := newSubscriptionRegistry()
-		_, ok := r.remove("nonexistent")
-		assert.False(t, ok)
-	})
 }

@@ -19,7 +19,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"maps"
 	"os"
 	"reflect"
 	"sync"
@@ -44,31 +43,36 @@ import (
 var _ configuration.Store = (*ConfigurationStore)(nil)
 
 // ConfigurationStore implements a Kubernetes ConfigMap-backed configuration store.
-// A single shared informer watches the configured ConfigMap and fans out change
-// events to all registered subscribers, avoiding per-subscription watches against
-// the API server.
+// A SharedIndexInformer watches the configured ConfigMap. Each Subscribe call
+// registers a per-subscriber event handler on the informer, which handles
+// initial state replay, change notifications, and deletion atomically.
 type ConfigurationStore struct {
 	kubeClient kubernetes.Interface
 	metadata   metadata
 	namespace  string
 	logger     logger.Logger
 
-	registry *subscriptionRegistry
-
-	// Shared informer lifecycle: started in Init, stopped in Close.
-	informerStore  cache.Store
+	informer       cache.SharedIndexInformer
 	informerCancel context.CancelFunc
 	informerWg     sync.WaitGroup
 
-	lock   sync.RWMutex
-	closed atomic.Bool
+	mu            sync.Mutex
+	subscriptions map[string]*subscription
+	closed        atomic.Bool
+}
+
+// subscription holds the informer registration and cancel function for a
+// single Subscribe call.
+type subscription struct {
+	registration cache.ResourceEventHandlerRegistration
+	cancel       context.CancelFunc
 }
 
 // NewKubernetesConfigMapStore returns a new Kubernetes ConfigMap configuration store.
 func NewKubernetesConfigMapStore(logger logger.Logger) configuration.Store {
 	return &ConfigurationStore{
-		logger:   logger,
-		registry: newSubscriptionRegistry(),
+		logger:        logger,
+		subscriptions: make(map[string]*subscription),
 	}
 }
 
@@ -102,7 +106,7 @@ func (s *ConfigurationStore) Init(ctx context.Context, meta configuration.Metada
 }
 
 func (s *ConfigurationStore) Get(_ context.Context, req *configuration.GetRequest) (*configuration.GetResponse, error) {
-	obj, exists, err := s.informerStore.GetByKey(s.namespace + "/" + s.metadata.ConfigMapName)
+	obj, exists, err := s.informer.GetStore().GetByKey(s.namespace + "/" + s.metadata.ConfigMapName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get ConfigMap %q from cache: %w", s.metadata.ConfigMapName, err)
 	}
@@ -116,24 +120,10 @@ func (s *ConfigurationStore) Get(_ context.Context, req *configuration.GetReques
 	}
 
 	allItems := configMapToItems(cm)
-
-	if len(req.Keys) == 0 {
-		return &configuration.GetResponse{Items: allItems}, nil
-	}
-
-	items := make(map[string]*configuration.Item, len(req.Keys))
-	for _, key := range req.Keys {
-		if item, ok := allItems[key]; ok {
-			items[key] = item
-		}
-	}
-	return &configuration.GetResponse{Items: items}, nil
+	return &configuration.GetResponse{Items: filterByKeys(allItems, req.Keys)}, nil
 }
 
 func (s *ConfigurationStore) Subscribe(ctx context.Context, req *configuration.SubscribeRequest, handler configuration.UpdateHandler) (string, error) {
-	s.lock.RLock()
-	defer s.lock.RUnlock()
-
 	if s.closed.Load() {
 		return "", errors.New("configuration store is closed")
 	}
@@ -141,48 +131,77 @@ func (s *ConfigurationStore) Subscribe(ctx context.Context, req *configuration.S
 	subscribeID := uuid.New().String()
 	childCtx, cancel := context.WithCancel(ctx)
 
-	sub := &subscriber{
+	subHandler := &subscriberHandler{
 		id:      subscribeID,
 		keys:    req.Keys,
 		handler: handler,
 		ctx:     childCtx,
-		cancel:  cancel,
+		logger:  s.logger,
 	}
-	// Read initial state from cache (instant, no API call).
-	resp, err := s.Get(childCtx, &configuration.GetRequest{
-		Keys:     req.Keys,
-		Metadata: req.Metadata,
-	})
+
+	reg, err := s.informer.AddEventHandler(subHandler)
 	if err != nil {
 		cancel()
-		return "", fmt.Errorf("failed to get initial state: %w", err)
+		return "", fmt.Errorf("failed to add event handler: %w", err)
 	}
 
-	s.registry.add(sub)
-
-	// Deliver initial state asynchronously. The Dapr sidecar's gRPC handler
-	// blocks until Subscribe returns (to send the subscription ID first), so
-	// calling the handler synchronously here would deadlock.
-	if len(resp.Items) > 0 {
-		go func() {
-			if hErr := handler(childCtx, &configuration.UpdateEvent{
-				ID:    subscribeID,
-				Items: resp.Items,
-			}); hErr != nil {
-				s.logger.Errorf("failed to send initial state for subscription %s: %v", subscribeID, hErr)
-			}
-		}()
+	s.mu.Lock()
+	s.subscriptions[subscribeID] = &subscription{
+		registration: reg,
+		cancel:       cancel,
 	}
+	s.mu.Unlock()
 
 	return subscribeID, nil
 }
 
-// startInformer starts a single informer that watches the configured ConfigMap
-// and fans out change events to all registered subscribers.
+func (s *ConfigurationStore) Unsubscribe(_ context.Context, req *configuration.UnsubscribeRequest) error {
+	s.mu.Lock()
+	sub, ok := s.subscriptions[req.ID]
+	if !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("subscription with id %s does not exist", req.ID)
+	}
+	delete(s.subscriptions, req.ID)
+	s.mu.Unlock()
+
+	if err := s.informer.RemoveEventHandler(sub.registration); err != nil {
+		s.logger.Errorf("failed to remove event handler for subscription %s: %v", req.ID, err)
+	}
+	sub.cancel()
+	return nil
+}
+
+func (s *ConfigurationStore) GetComponentMetadata() (metadataInfo contribMetadata.MetadataMap) {
+	metadataStruct := metadata{}
+	contribMetadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo, contribMetadata.ConfigurationStoreType)
+	return metadataInfo
+}
+
+func (s *ConfigurationStore) Close() error {
+	s.closed.Store(true)
+
+	s.mu.Lock()
+	for id, sub := range s.subscriptions {
+		if err := s.informer.RemoveEventHandler(sub.registration); err != nil {
+			s.logger.Errorf("failed to remove event handler for subscription %s: %v", id, err)
+		}
+		sub.cancel()
+		delete(s.subscriptions, id)
+	}
+	s.mu.Unlock()
+
+	if s.informerCancel != nil {
+		s.informerCancel()
+	}
+	s.informerWg.Wait()
+
+	return nil
+}
+
+// startInformer creates and starts a SharedIndexInformer that watches the
+// configured ConfigMap. Per-subscriber handlers are added later via Subscribe.
 func (s *ConfigurationStore) startInformer(ctx context.Context) error {
-	// The informer must outlive the Init context (which is request-scoped), so
-	// we create a dedicated context controlled by s.informerCancel that lives
-	// until Close() is called.
 	informerCtx, cancel := context.WithCancel(context.Background())
 	s.informerCancel = cancel
 
@@ -203,34 +222,17 @@ func (s *ConfigurationStore) startInformer(ctx context.Context) error {
 		},
 	}
 
-	store, controller := cache.NewInformerWithOptions(cache.InformerOptions{
-		ListerWatcher: watchlist,
-		ObjectType:    &corev1.ConfigMap{},
-		ResyncPeriod:  resyncPeriod,
-		Handler: cache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj any) {
-				s.fanOutAdd(obj)
-			},
-			UpdateFunc: func(oldObj, newObj any) {
-				s.fanOutUpdate(oldObj, newObj)
-			},
-			DeleteFunc: func(obj any) {
-				s.fanOutDelete(obj)
-			},
-		},
-	})
-
-	s.informerStore = store
+	s.informer = cache.NewSharedIndexInformer(watchlist, &corev1.ConfigMap{}, resyncPeriod, cache.Indexers{})
 
 	s.informerWg.Add(1)
 	go func() {
 		defer s.informerWg.Done()
-		controller.Run(informerCtx.Done())
+		s.informer.Run(informerCtx.Done())
 		s.logger.Info("ConfigMap informer stopped")
 	}()
 
 	// Use Init's context for the sync check — it provides a timeout bound.
-	if !cache.WaitForCacheSync(ctx.Done(), controller.HasSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), s.informer.HasSynced) {
 		cancel()
 		s.informerWg.Wait()
 		return fmt.Errorf("failed to sync informer cache for ConfigMap %q", s.metadata.ConfigMapName)
@@ -239,145 +241,86 @@ func (s *ConfigurationStore) startInformer(ctx context.Context) error {
 	return nil
 }
 
-// fanOutAdd dispatches all items from a newly created ConfigMap to subscribers.
-func (s *ConfigurationStore) fanOutAdd(obj any) {
-	cm, ok := obj.(*corev1.ConfigMap)
-	if !ok {
-		s.logger.Warn("received non-ConfigMap object in add handler")
+// subscriberHandler implements cache.ResourceEventHandler for a single
+// subscriber. The informer calls these methods directly — OnAdd is also used
+// for initial state replay when the handler is registered on a synced informer.
+type subscriberHandler struct {
+	id      string
+	keys    []string // empty means all keys
+	handler configuration.UpdateHandler
+	ctx     context.Context
+	logger  logger.Logger
+}
+
+func (h *subscriberHandler) OnAdd(obj any, _ bool) {
+	cm := extractConfigMap(obj)
+	if cm == nil {
 		return
 	}
 
-	items := configMapToItems(cm)
+	items := filterByKeys(configMapToItems(cm), h.keys)
 	if len(items) == 0 {
 		return
 	}
-
-	s.dispatchToSubscribers(items)
+	h.send(items)
 }
 
-// fanOutDelete notifies subscribers that all keys have been deleted when the
-// ConfigMap is removed from the cluster.
-func (s *ConfigurationStore) fanOutDelete(obj any) {
-	cm, ok := obj.(*corev1.ConfigMap)
-	if !ok {
-		s.logger.Warn("received non-ConfigMap object in delete handler")
+func (h *subscriberHandler) OnUpdate(oldObj, newObj any) {
+	oldCM := extractConfigMap(oldObj)
+	newCM := extractConfigMap(newObj)
+	if oldCM == nil || newCM == nil {
 		return
 	}
 
-	items := make(map[string]*configuration.Item, len(cm.Data)+len(cm.BinaryData))
-	for k := range cm.Data {
-		items[k] = &configuration.Item{
-			Value:    "",
-			Version:  cm.ResourceVersion,
-			Metadata: map[string]string{"deleted": "true"},
-		}
-	}
-	for k := range cm.BinaryData {
-		items[k] = &configuration.Item{
-			Value:    "",
-			Version:  cm.ResourceVersion,
-			Metadata: map[string]string{"deleted": "true"},
-		}
-	}
-
-	if len(items) == 0 {
-		return
-	}
-
-	s.dispatchToSubscribers(items)
-}
-
-// fanOutUpdate dispatches ConfigMap change events to all registered subscribers.
-func (s *ConfigurationStore) fanOutUpdate(oldObj, newObj any) {
-	oldCM, ok1 := oldObj.(*corev1.ConfigMap)
-	newCM, ok2 := newObj.(*corev1.ConfigMap)
-	if !ok1 || !ok2 {
-		s.logger.Warn("received non-ConfigMap object in update handler")
-		return
-	}
-
-	// Skip no-op updates.
 	if oldCM.ResourceVersion == newCM.ResourceVersion {
 		return
 	}
 
-	allChanged := computeChangedItems(oldCM, newCM)
-	if len(allChanged) == 0 {
+	changed := computeChangedItems(oldCM, newCM)
+	items := filterByKeys(changed, h.keys)
+	if len(items) == 0 {
+		return
+	}
+	h.send(items)
+}
+
+func (h *subscriberHandler) OnDelete(obj any) {
+	cm := extractConfigMap(obj)
+	if cm == nil {
 		return
 	}
 
-	s.dispatchToSubscribers(allChanged)
+	items := filterByKeys(deletedItems(cm), h.keys)
+	if len(items) == 0 {
+		return
+	}
+	h.send(items)
 }
 
-// dispatchToSubscribers snapshots subscribers under a read lock, then dispatches
-// items concurrently without holding the lock. This prevents deadlock if a
-// handler calls Unsubscribe.
-func (s *ConfigurationStore) dispatchToSubscribers(allItems map[string]*configuration.Item) {
-	type subSnapshot struct {
-		id      string
-		handler configuration.UpdateHandler
-		ctx     context.Context
-		items   map[string]*configuration.Item
+func (h *subscriberHandler) send(items map[string]*configuration.Item) {
+	if h.ctx.Err() != nil {
+		return
 	}
-
-	// Snapshot under lock.
-	s.registry.mu.RLock()
-
-	snapshots := make([]subSnapshot, 0, len(s.registry.byID))
-
-	for _, sub := range s.registry.allKeys {
-		if sub.ctx.Err() != nil {
-			continue
-		}
-		itemsCopy := make(map[string]*configuration.Item, len(allItems))
-		maps.Copy(itemsCopy, allItems)
-		snapshots = append(snapshots, subSnapshot{
-			id: sub.id, handler: sub.handler, ctx: sub.ctx, items: itemsCopy,
-		})
+	if err := h.handler(h.ctx, &configuration.UpdateEvent{
+		ID:    h.id,
+		Items: items,
+	}); err != nil {
+		h.logger.Errorf("subscription %s handler error: %v", h.id, err)
 	}
+}
 
-	for changedKey, item := range allItems {
-		if subs, ok := s.registry.byKey[changedKey]; ok {
-			for _, sub := range subs {
-				if sub.ctx.Err() != nil {
-					continue
-				}
-				// Find or create this subscriber's snapshot.
-				found := false
-				for i := range snapshots {
-					if snapshots[i].id == sub.id {
-						snapshots[i].items[changedKey] = item
-						found = true
-						break
-					}
-				}
-				if !found {
-					snapshots = append(snapshots, subSnapshot{
-						id: sub.id, handler: sub.handler, ctx: sub.ctx,
-						items: map[string]*configuration.Item{changedKey: item},
-					})
-				}
-			}
+// extractConfigMap extracts a *corev1.ConfigMap from an informer event object,
+// handling the cache.DeletedFinalStateUnknown wrapper.
+func extractConfigMap(obj any) *corev1.ConfigMap {
+	switch t := obj.(type) {
+	case *corev1.ConfigMap:
+		return t
+	case cache.DeletedFinalStateUnknown:
+		if cm, ok := t.Obj.(*corev1.ConfigMap); ok {
+			return cm
 		}
 	}
-
-	s.registry.mu.RUnlock()
-
-	// Dispatch without holding any lock.
-	var wg sync.WaitGroup
-	for _, snap := range snapshots {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := snap.handler(snap.ctx, &configuration.UpdateEvent{
-				ID:    snap.id,
-				Items: snap.items,
-			}); err != nil {
-				s.logger.Errorf("subscription %s handler error: %v", snap.id, err)
-			}
-		}()
-	}
-	wg.Wait()
+	return nil
 }
 
 // configMapToItems builds configuration items from all data in a ConfigMap.
@@ -400,12 +343,47 @@ func configMapToItems(cm *corev1.ConfigMap) map[string]*configuration.Item {
 	return items
 }
 
+// deletedItems builds configuration items with "deleted" metadata for every
+// key in the given ConfigMap.
+func deletedItems(cm *corev1.ConfigMap) map[string]*configuration.Item {
+	items := make(map[string]*configuration.Item, len(cm.Data)+len(cm.BinaryData))
+	for k := range cm.Data {
+		items[k] = &configuration.Item{
+			Value:    "",
+			Version:  cm.ResourceVersion,
+			Metadata: map[string]string{"deleted": "true"},
+		}
+	}
+	for k := range cm.BinaryData {
+		items[k] = &configuration.Item{
+			Value:    "",
+			Version:  cm.ResourceVersion,
+			Metadata: map[string]string{"deleted": "true"},
+		}
+	}
+	return items
+}
+
+// filterByKeys returns only the items matching the given keys.
+// If keys is empty, all items are returned.
+func filterByKeys(items map[string]*configuration.Item, keys []string) map[string]*configuration.Item {
+	if len(keys) == 0 {
+		return items
+	}
+	filtered := make(map[string]*configuration.Item, len(keys))
+	for _, k := range keys {
+		if item, ok := items[k]; ok {
+			filtered[k] = item
+		}
+	}
+	return filtered
+}
+
 // computeChangedItems computes the set of configuration items that changed
 // between oldCM and newCM across both Data and BinaryData.
 func computeChangedItems(oldCM, newCM *corev1.ConfigMap) map[string]*configuration.Item {
 	changedItems := make(map[string]*configuration.Item)
 
-	// Detect added or modified keys in data.
 	for k, newVal := range newCM.Data {
 		oldVal, existed := oldCM.Data[k]
 		if !existed || oldVal != newVal {
@@ -417,7 +395,6 @@ func computeChangedItems(oldCM, newCM *corev1.ConfigMap) map[string]*configurati
 		}
 	}
 
-	// Detect added or modified keys in binaryData.
 	for k, newVal := range newCM.BinaryData {
 		oldVal, existed := oldCM.BinaryData[k]
 		if !existed || !bytes.Equal(oldVal, newVal) {
@@ -429,9 +406,6 @@ func computeChangedItems(oldCM, newCM *corev1.ConfigMap) map[string]*configurati
 		}
 	}
 
-	// Detect deleted keys: a key is deleted only if it existed in old data or
-	// binaryData and is now absent from BOTH new data and binaryData. This
-	// prevents a false deletion when a key moves between data and binaryData.
 	allOldKeys := make(map[string]struct{})
 	for k := range oldCM.Data {
 		allOldKeys[k] = struct{}{}
@@ -452,40 +426,6 @@ func computeChangedItems(oldCM, newCM *corev1.ConfigMap) map[string]*configurati
 	}
 
 	return changedItems
-}
-
-func (s *ConfigurationStore) Unsubscribe(_ context.Context, req *configuration.UnsubscribeRequest) error {
-	s.lock.RLock()
-	defer s.lock.RUnlock()
-
-	if sub, ok := s.registry.remove(req.ID); ok {
-		sub.cancel()
-		return nil
-	}
-
-	return fmt.Errorf("subscription with id %s does not exist", req.ID)
-}
-
-func (s *ConfigurationStore) GetComponentMetadata() (metadataInfo contribMetadata.MetadataMap) {
-	metadataStruct := metadata{}
-	contribMetadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo, contribMetadata.ConfigurationStoreType)
-	return metadataInfo
-}
-
-func (s *ConfigurationStore) Close() error {
-	s.closed.Store(true)
-
-	s.lock.Lock()
-	defer s.lock.Unlock()
-
-	s.registry.cancelAll()
-
-	if s.informerCancel != nil {
-		s.informerCancel()
-	}
-	s.informerWg.Wait()
-
-	return nil
 }
 
 func resolveNamespace() string {
