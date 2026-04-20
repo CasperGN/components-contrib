@@ -179,9 +179,8 @@ func (s *ConfigurationStore) GetComponentMetadata() (metadataInfo contribMetadat
 }
 
 func (s *ConfigurationStore) Close() error {
-	s.closed.Store(true)
-
 	s.mu.Lock()
+	s.closed.Store(true)
 	for id, sub := range s.subscriptions {
 		if err := s.informer.RemoveEventHandler(sub.registration); err != nil {
 			s.logger.Errorf("failed to remove event handler for subscription %s: %v", id, err)
